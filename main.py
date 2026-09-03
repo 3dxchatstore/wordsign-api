@@ -98,21 +98,60 @@ def get_keys():
 
 
 def extract_fingerprint(world_data: dict) -> set:
-    """Extracts object types and 3D grid positions into a set of tokens."""
+    """Universal 3D layout scanner that detects any coordinate format."""
     tokens = set()
+
+    def parse_num(val):
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
 
     def scan_node(node):
         if isinstance(node, dict):
-            pos = node.get("pos") or node.get("position")
-            if not pos and all(k in node for k in ("x", "y", "z")):
-                pos = [node["x"], node["y"], node["z"]]
+            # Normalize dictionary keys to lowercase for flexible matching
+            low_dict = {str(k).lower(): v for k, v in node.items()}
 
-            if isinstance(pos, (list, tuple)) and len(pos) >= 3:
-                obj_name = str(node.get("type") or node.get("name") or "item")
-                # Round coordinates to 1 decimal place (~10cm grid tolerance)
-                token = f"{obj_name}_{round(float(pos[0]), 1)}_{round(float(pos[1]), 1)}_{round(float(pos[2]), 1)}"
+            x = y = z = None
+
+            # 1. Check direct x, y, z or px, py, pz coordinate keys
+            for x_k, y_k, z_k in [("x", "y", "z"), ("px", "py", "pz"), ("posx", "posy", "posz")]:
+                if x_k in low_dict and y_k in low_dict and z_k in low_dict:
+                    nx, ny, nz = parse_num(low_dict[x_k]), parse_num(low_dict[y_k]), parse_num(low_dict[z_k])
+                    if nx is not None and ny is not None and nz is not None:
+                        x, y, z = nx, ny, nz
+                        break
+
+            # 2. Check position sub-structures (e.g. "pos": [x, y, z] or "position": {"x":..., "y":..., "z":...})
+            if x is None:
+                for p_k in ("pos", "position", "location", "transform"):
+                    if p_k in low_dict:
+                        p_val = low_dict[p_k]
+                        if isinstance(p_val, (list, tuple)) and len(p_val) >= 3:
+                            nx, ny, nz = parse_num(p_val[0]), parse_num(p_val[1]), parse_num(p_val[2])
+                            if nx is not None and ny is not None and nz is not None:
+                                x, y, z = nx, ny, nz
+                                break
+                        elif isinstance(p_val, dict):
+                            p_low = {str(k).lower(): v for k, v in p_val.items()}
+                            if "x" in p_low and "y" in p_low and "z" in p_low:
+                                nx, ny, nz = parse_num(p_low["x"]), parse_num(p_low["y"]), parse_num(p_low["z"])
+                                if nx is not None and ny is not None and nz is not None:
+                                    x, y, z = nx, ny, nz
+                                    break
+
+            # 3. If valid 3D coordinates exist, create an item token rounded to ~10cm grid tolerance
+            if x is not None and y is not None and z is not None:
+                obj_name = "item"
+                for n_k in ("name", "type", "prefab", "model", "id", "item"):
+                    if n_k in low_dict and low_dict[n_k]:
+                        obj_name = str(low_dict[n_k])
+                        break
+
+                token = f"{obj_name}_{round(x, 1)}_{round(y, 1)}_{round(z, 1)}"
                 tokens.add(token)
 
+            # Traverse child objects
             for v in node.values():
                 scan_node(v)
         elif isinstance(node, list):
@@ -173,7 +212,6 @@ async def sign_world(
     existing_registry = world_data.get("_ProtectionRegistry")
     final_author = author_name.strip()
 
-    # Passphrase check for updates
     if existing_registry and isinstance(existing_registry, dict):
         existing_hash = existing_registry.get("passphrase_hash", "")
         if existing_hash:
@@ -191,7 +229,6 @@ async def sign_world(
     if not final_author:
         final_author = "Unknown"
 
-    # Fingerprint Similarity Checking for New Registrations (Scenario 1)
     current_fp = extract_fingerprint(world_data)
     stored_fps = load_fingerprints()
 
@@ -200,7 +237,7 @@ async def sign_world(
             prev_fp = set(entry.get("fp", []))
             score = compute_similarity(current_fp, prev_fp)
 
-            if score >= 0.80:  # 80% layout similarity match
+            if score >= 0.80:
                 match_pct = int(score * 100)
                 orig_title = entry.get("title", "Untitled")
                 orig_author = entry.get("author", "Unknown")
@@ -228,7 +265,6 @@ async def sign_world(
 
     signed_json_bytes = json.dumps(world_data, indent=2).encode("utf-8")
 
-    # Save new room fingerprint to database
     if current_fp:
         stored_fps.insert(0, {
             "title": world_title or "Untitled",
@@ -237,7 +273,6 @@ async def sign_world(
         })
         save_fingerprints(stored_fps)
 
-    # Update global counters & activity log
     stats_data["protected"] += 1
     t_clean = world_title.strip() if world_title.strip() else "Untitled"
 
@@ -246,7 +281,6 @@ async def sign_world(
     stats_data["history"] = stats_data["history"][:20]
     save_stats()
 
-    # UTC Timestamped download filename
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SUTC")
     safe_author = final_author.replace(" ", "_")
     base_name = file.filename.replace(".world", "")
@@ -327,7 +361,6 @@ async def compare_two_files(
     file_a: UploadFile = File(...),
     file_b: UploadFile = File(...)
 ):
-    """Direct 1-vs-1 compare endpoint (Scenario 2)."""
     bytes_a = await file_a.read()
     bytes_b = await file_b.read()
 
