@@ -31,7 +31,7 @@ SHAPE_PREFIXES = (
 
 
 def is_base_shape(obj_name: str) -> bool:
-    """Checks if an object name belongs to the 3DXChat base shape whitelist."""
+    """Checks if an object name belongs to the custom shape whitelist."""
     low = obj_name.lower().strip()
     return any(low.startswith(prefix) for prefix in SHAPE_PREFIXES)
 
@@ -110,9 +110,10 @@ def get_keys():
     return private_key, private_key.public_key()
 
 
-def extract_item_list(world_data: dict):
-    """Extracts 3D items and classifies them into Custom Shapes vs Premade Objects."""
-    raw_items = []
+def extract_shapes_list(world_data: dict):
+    """Filters and extracts ONLY custom building shapes from the file."""
+    shapes = []
+    total_items_count = 0
 
     def parse_num(val):
         try:
@@ -121,6 +122,7 @@ def extract_item_list(world_data: dict):
             return None
 
     def scan_node(node):
+        nonlocal total_items_count
         if isinstance(node, dict):
             x = y = z = None
             obj_name = str(node.get("n", node.get("name", node.get("type", "item"))))
@@ -142,13 +144,14 @@ def extract_item_list(world_data: dict):
                             break
 
             if x is not None and y is not None and z is not None and obj_name.lower() != "group":
-                raw_items.append({
-                    "name": obj_name.lower(),
-                    "x": float(x),
-                    "y": float(y),
-                    "z": float(z),
-                    "is_shape": is_base_shape(obj_name)
-                })
+                total_items_count += 1
+                if is_base_shape(obj_name):
+                    shapes.append({
+                        "name": obj_name.lower(),
+                        "x": float(x),
+                        "y": float(y),
+                        "z": float(z)
+                    })
 
             for v in node.values():
                 scan_node(v)
@@ -158,13 +161,13 @@ def extract_item_list(world_data: dict):
                 scan_node(item)
 
     scan_node(world_data)
-    return raw_items
+    return shapes, total_items_count
 
 
-def match_sets_with_delta_alignment(list_a, list_b):
+def match_shapes_with_delta_alignment(list_a, list_b):
     """
-    Scans spatial layout using delta translation sampling.
-    Evaluates relative to min(len_A, len_B) to capture both partial deletions and decor additions.
+    Measures custom architecture overlap using delta spatial alignment.
+    Evaluates against min(len_A, len_B) to prevent dilution from extra objects.
     """
     if not list_a or not list_b:
         return 0, 0
@@ -290,31 +293,24 @@ async def sign_world(
     if not final_author:
         final_author = "Unknown"
 
-    items_current = extract_item_list(world_data)
-    shapes_current = [i for i in items_current if i["is_shape"]]
-    premade_current = [i for i in items_current if not i["is_shape"]]
+    shapes_current, _ = extract_shapes_list(world_data)
     stored_fps = load_fingerprints()
 
-    if not is_update and not force_register and items_current:
+    if not is_update and not force_register and shapes_current:
         for entry in stored_fps:
-            prev_items = entry.get("items", [])
-            prev_shapes = [i for i in prev_items if i.get("is_shape")]
-            prev_premade = [i for i in prev_items if not i.get("is_shape")]
+            prev_shapes = entry.get("shapes", [])
+            s_pct, _ = match_shapes_with_delta_alignment(shapes_current, prev_shapes)
 
-            s_pct, _ = match_sets_with_delta_alignment(shapes_current, prev_shapes)
-            p_pct, _ = match_sets_with_delta_alignment(premade_current, prev_premade)
-            highest_score = max(s_pct, p_pct)
-
-            if highest_score >= 80:
+            if s_pct >= 80:
                 orig_title = entry.get("title", "Untitled")
                 orig_author = entry.get("author", "Unknown")
                 return Response(
                     content=json.dumps({
                         "similarity_warning": True,
-                        "match_percentage": highest_score,
+                        "match_percentage": s_pct,
                         "matched_title": orig_title,
                         "matched_author": orig_author,
-                        "message": f"A similar file with {highest_score}% layout similarity has been uploaded before ('{orig_title}' by {orig_author})."
+                        "message": f"A similar file with {s_pct}% custom structure similarity has been uploaded before ('{orig_title}' by {orig_author})."
                     }),
                     status_code=200,
                     media_type="application/json"
@@ -334,11 +330,11 @@ async def sign_world(
 
     signed_json_bytes = json.dumps(world_data, indent=2).encode("utf-8")
 
-    if items_current:
+    if shapes_current:
         stored_fps.insert(0, {
             "title": world_title or "Untitled",
             "author": final_author,
-            "items": items_current
+            "shapes": shapes_current
         })
         save_fingerprints(stored_fps)
 
@@ -441,34 +437,20 @@ async def compare_two_files(
     except Exception:
         raise HTTPException(status_code=400, detail="One or both files are invalid .world JSON.")
 
-    items_a = extract_item_list(data_a)
-    items_b = extract_item_list(data_b)
+    shapes_a, total_a = extract_shapes_list(data_a)
+    shapes_b, total_b = extract_shapes_list(data_b)
 
-    shapes_a = [i for i in items_a if i["is_shape"]]
-    shapes_b = [i for i in items_b if i["is_shape"]]
-
-    premade_a = [i for i in items_a if not i["is_shape"]]
-    premade_b = [i for i in items_b if not i["is_shape"]]
-
-    shapes_pct, shared_shapes = match_sets_with_delta_alignment(shapes_a, shapes_b)
-    premade_pct, shared_premade = match_sets_with_delta_alignment(premade_a, premade_b)
-
-    highest_pct = max(shapes_pct, premade_pct)
+    shapes_pct, shared_shapes = match_shapes_with_delta_alignment(shapes_a, shapes_b)
 
     return {
-        "highest_match_percentage": highest_pct,
-        "shapes_match_percentage": shapes_pct,
-        "premade_match_percentage": premade_pct,
+        "match_percentage": shapes_pct,
         "file_a": {
             "shapes": len(shapes_a),
-            "premade": len(premade_a),
-            "total": len(items_a)
+            "total": total_a
         },
         "file_b": {
             "shapes": len(shapes_b),
-            "premade": len(premade_b),
-            "total": len(items_b)
+            "total": total_b
         },
-        "shared_shapes": shared_shapes,
-        "shared_premade": shared_premade
+        "shared_shapes": shared_shapes
     }
