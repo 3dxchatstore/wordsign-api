@@ -1,10 +1,11 @@
 import os
 import json
 import hashlib
+import uuid
 import urllib.request
 from datetime import datetime, timezone
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from cryptography.hazmat.primitives.serialization import load_pem_private_key, Encoding, PublicFormat
 
@@ -19,7 +20,6 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-# UPSTASH REDIS REST API HELPER
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
@@ -32,13 +32,11 @@ SHAPE_PREFIXES = (
 
 
 def is_base_shape(obj_name: str) -> bool:
-    """Checks if an object name belongs to the custom shape whitelist."""
     low = obj_name.lower().strip()
     return any(low.startswith(prefix) for prefix in SHAPE_PREFIXES)
 
 
 def redis_cmd(command_list):
-    """Executes commands on Upstash Redis over lightweight HTTP."""
     if not UPSTASH_URL or not UPSTASH_TOKEN:
         return None
     try:
@@ -112,7 +110,6 @@ def get_keys():
 
 
 def extract_shapes_list(world_data: dict):
-    """Filters and extracts custom building shapes along with position and scale."""
     shapes = []
     total_items_count = 0
 
@@ -129,7 +126,6 @@ def extract_shapes_list(world_data: dict):
             sx = sy = sz = 1.0
             obj_name = str(node.get("n", node.get("name", node.get("type", "item"))))
 
-            # Parse Position
             for p_key in ("p", "pos", "position", "location"):
                 if p_key in node and isinstance(node[p_key], (list, tuple)) and len(node[p_key]) >= 3:
                     nx, ny, nz = parse_num(node[p_key][0]), parse_num(node[p_key][1]), parse_num(node[p_key][2])
@@ -146,7 +142,6 @@ def extract_shapes_list(world_data: dict):
                             x, y, z = nx, ny, nz
                             break
 
-            # Parse Scale
             for s_key in ("s", "scale", "size"):
                 if s_key in node and isinstance(node[s_key], (list, tuple)) and len(node[s_key]) >= 3:
                     nsx, nsy, nsz = parse_num(node[s_key][0]), parse_num(node[s_key][1]), parse_num(node[s_key][2])
@@ -179,10 +174,6 @@ def extract_shapes_list(world_data: dict):
 
 
 def match_shapes_with_delta_alignment(list_a, list_b):
-    """
-    Measures custom architecture overlap using delta spatial alignment and scale matching.
-    Enforces a minimum 3-shape match threshold (noise floor) to prevent accidental false positives.
-    """
     if not list_a or not list_b:
         return 0, 0
 
@@ -196,9 +187,11 @@ def match_shapes_with_delta_alignment(list_a, list_b):
     delta_counts = {}
     for a in sample_a:
         matches = b_by_name.get(a["name"], [])
+        a_sx, a_sy, a_sz = a.get("sx", 1.0), a.get("sy", 1.0), a.get("sz", 1.0)
+
         for b in matches:
-            # Require shape dimensions (scale) to match before building candidate offset
-            if abs(b["sx"] - a["sx"]) <= 0.1 and abs(b["sy"] - a["sy"]) <= 0.1 and abs(b["sz"] - a["sz"]) <= 0.1:
+            b_sx, b_sy, b_sz = b.get("sx", 1.0), b.get("sy", 1.0), b.get("sz", 1.0)
+            if abs(b_sx - a_sx) <= 0.1 and abs(b_sy - a_sy) <= 0.1 and abs(b_sz - a_sz) <= 0.1:
                 dx = round(b["x"] - a["x"], 1)
                 dy = round(b["y"] - a["y"], 1)
                 dz = round(b["z"] - a["z"], 1)
@@ -211,7 +204,6 @@ def match_shapes_with_delta_alignment(list_a, list_b):
     best_dx, best_dy, best_dz = max(delta_counts, key=delta_counts.get)
     best_count = delta_counts[(best_dx, best_dy, best_dz)]
 
-    # NOISE FLOOR: Discard candidate vectors with fewer than 3 matching shapes
     min_required_matches = 3
     if min(len(list_a), len(list_b)) >= 5 and best_count < min_required_matches:
         return 0, 0
@@ -223,9 +215,9 @@ def match_shapes_with_delta_alignment(list_a, list_b):
             round(a["x"], 1),
             round(a["y"], 1),
             round(a["z"], 1),
-            a["sx"],
-            a["sy"],
-            a["sz"]
+            a.get("sx", 1.0),
+            a.get("sy", 1.0),
+            a.get("sz", 1.0)
         ))
 
     shared_count = 0
@@ -235,6 +227,7 @@ def match_shapes_with_delta_alignment(list_a, list_b):
         shifted_x = round(b["x"] - best_dx, 1)
         shifted_y = round(b["y"] - best_dy, 1)
         shifted_z = round(b["z"] - best_dz, 1)
+        b_sx, b_sy, b_sz = b.get("sx", 1.0), b.get("sy", 1.0), b.get("sz", 1.0)
 
         matched = False
         for dx in (-0.1, 0.0, 0.1):
@@ -245,9 +238,9 @@ def match_shapes_with_delta_alignment(list_a, list_b):
                         round(shifted_x + dx, 1),
                         round(shifted_y + dy, 1),
                         round(shifted_z + dz, 1),
-                        b["sx"],
-                        b["sy"],
-                        b["sz"]
+                        b_sx,
+                        b_sy,
+                        b_sz
                     )
                     if test_key in a_spatial and test_key not in matched_keys:
                         matched = True
@@ -289,6 +282,7 @@ def get_stats():
 @app.post("/sign")
 async def sign_world(
     file: UploadFile = File(...),
+    wsig_file: UploadFile = File(None),
     world_title: str = Form(""),
     author_name: str = Form(""),
     author: str = Form(""),
@@ -308,46 +302,67 @@ async def sign_world(
     existing_registry = world_data.get("_ProtectionRegistry")
     submitted_author = author_name.strip() or author.strip()
 
-    if existing_registry and isinstance(existing_registry, dict):
-        existing_hash = existing_registry.get("passphrase_hash", "")
-        if existing_hash:
+    # Handle Version Update Verification via .wsig
+    if is_update or existing_registry:
+        if not existing_registry:
+            raise HTTPException(status_code=400, detail="This file is not signed yet. Use Tab 1 to sign a new file.")
+
+        stored_key_hash = existing_registry.get("key_hash", "")
+        stored_pass_hash = existing_registry.get("passphrase_hash", "")
+
+        # Verify .wsig Key File
+        if not wsig_file:
+            raise HTTPException(status_code=400, detail="Signature key file (.wsig) required to update this world.")
+
+        wsig_bytes = await wsig_file.read()
+        try:
+            wsig_data = json.loads(wsig_bytes.decode("utf-8"))
+            secret_key = wsig_data.get("signature_key", "")
+            if hashlib.sha256(secret_key.encode()).hexdigest() != stored_key_hash:
+                raise HTTPException(status_code=401, detail="Invalid .wsig key file! Key does not match this map.")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid .wsig signature file.")
+
+        # Verify Optional Passphrase
+        if stored_pass_hash:
             input_hash = hashlib.sha256(passphrase.encode()).hexdigest() if passphrase else ""
-            if input_hash != existing_hash:
-                raise HTTPException(
-                    status_code=401,
-                    detail="File protected! Incorrect passphrase. Only the original builder can update this world."
-                )
+            if input_hash != stored_pass_hash:
+                raise HTTPException(status_code=401, detail="Incorrect passphrase.")
 
-        original_author = existing_registry.get("author_name", "")
-        final_author = submitted_author if submitted_author else original_author
+        final_author = submitted_author if submitted_author else existing_registry.get("author_name", "Unknown")
+        signature_key = wsig_data.get("signature_key")
+        key_hash = stored_key_hash
     else:
-        final_author = submitted_author
-
-    if not final_author:
-        final_author = "Unknown"
+        final_author = submitted_author if submitted_author else "Unknown"
+        signature_key = str(uuid.uuid4())
+        key_hash = hashlib.sha256(signature_key.encode()).hexdigest()
 
     shapes_current, _ = extract_shapes_list(world_data)
     stored_fps = load_fingerprints()
 
     if not is_update and not force_register and shapes_current:
         for entry in stored_fps:
-            prev_shapes = entry.get("shapes", [])
-            s_pct, _ = match_shapes_with_delta_alignment(shapes_current, prev_shapes)
+            try:
+                prev_shapes = entry.get("shapes", entry.get("items", []))
+                s_pct, _ = match_shapes_with_delta_alignment(shapes_current, prev_shapes)
 
-            if s_pct >= 80:
-                orig_title = entry.get("title", "Untitled")
-                orig_author = entry.get("author", "Unknown")
-                return Response(
-                    content=json.dumps({
-                        "similarity_warning": True,
-                        "match_percentage": s_pct,
-                        "matched_title": orig_title,
-                        "matched_author": orig_author,
-                        "message": f"A similar file with {s_pct}% custom structure similarity has been uploaded before ('{orig_title}' by {orig_author})."
-                    }),
-                    status_code=200,
-                    media_type="application/json"
-                )
+                if s_pct >= 80:
+                    orig_title = entry.get("title", "Untitled")
+                    orig_author = entry.get("author", "Unknown")
+                    return Response(
+                        content=json.dumps({
+                            "similarity_warning": True,
+                            "match_percentage": s_pct,
+                            "matched_title": orig_title,
+                            "matched_author": orig_author,
+                            "message": f"A similar file with {s_pct}% custom structure similarity has been uploaded before ('{orig_title}' by {orig_author})."
+                        }),
+                        status_code=200,
+                        media_type="application/json"
+                    )
+            except Exception as e:
+                print("Error matching against legacy fingerprint:", e)
+                continue
 
     pass_hash = hashlib.sha256(passphrase.encode()).hexdigest() if passphrase else ""
     timestamp_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -358,10 +373,20 @@ async def sign_world(
         "contact": contact.strip() if contact.strip() else (existing_registry.get("contact") if existing_registry else ""),
         "copy_label": copy_label,
         "timestamp": timestamp_str,
-        "passphrase_hash": pass_hash
+        "passphrase_hash": pass_hash,
+        "key_hash": key_hash
     }
 
-    signed_json_bytes = json.dumps(world_data, indent=2).encode("utf-8")
+    signed_json_str = json.dumps(world_data, indent=2)
+
+    wsig_payload = {
+        "system": "WorldSign Security Registry",
+        "world_title": world_title or "Untitled",
+        "author_name": final_author,
+        "timestamp": timestamp_str,
+        "signature_key": signature_key
+    }
+    wsig_json_str = json.dumps(wsig_payload, indent=2)
 
     if shapes_current:
         stored_fps.insert(0, {
@@ -383,13 +408,14 @@ async def sign_world(
     safe_author = final_author.replace(" ", "_")
     base_name = file.filename.replace(".world", "")
     prefix = "updated" if is_update else "signed"
-    download_filename = f"{prefix}_{safe_author}_{base_name}_{filename_timestamp}.world"
 
-    return Response(
-        content=signed_json_bytes,
-        media_type="application/octet-stream",
-        headers={"Content-Disposition": f"attachment; filename={download_filename}"}
-    )
+    return JSONResponse(content={
+        "success": True,
+        "world_file_content": signed_json_str,
+        "world_filename": f"{prefix}_{safe_author}_{base_name}_{filename_timestamp}.world",
+        "wsig_file_content": wsig_json_str,
+        "wsig_filename": f"{prefix}_{safe_author}_{base_name}_{filename_timestamp}.wsig"
+    })
 
 
 @app.post("/verify")
@@ -425,21 +451,30 @@ async def verify_world(file: UploadFile = File(...)):
 @app.post("/release")
 async def release_ownership(
     file: UploadFile = File(...),
+    wsig_file: UploadFile = File(...),
     passphrase: str = Form("")
 ):
     file_bytes = await file.read()
+    wsig_bytes = await wsig_file.read()
 
     try:
         world_data = json.loads(file_bytes.decode("utf-8"))
+        wsig_data = json.loads(wsig_bytes.decode("utf-8"))
         registry = world_data.get("_ProtectionRegistry")
 
         if not registry or not isinstance(registry, dict):
             raise HTTPException(status_code=400, detail="File is not signed.")
 
-        stored_hash = registry.get("passphrase_hash", "")
-        if stored_hash:
+        stored_key_hash = registry.get("key_hash", "")
+        secret_key = wsig_data.get("signature_key", "")
+
+        if hashlib.sha256(secret_key.encode()).hexdigest() != stored_key_hash:
+            raise HTTPException(status_code=401, detail="Invalid .wsig key file! Signature key does not match this world file.")
+
+        stored_pass_hash = registry.get("passphrase_hash", "")
+        if stored_pass_hash:
             input_hash = hashlib.sha256(passphrase.encode()).hexdigest()
-            if input_hash != stored_hash:
+            if input_hash != stored_pass_hash:
                 raise HTTPException(status_code=401, detail="Incorrect passphrase.")
 
         del world_data["_ProtectionRegistry"]
@@ -453,7 +488,7 @@ async def release_ownership(
     except HTTPException:
         raise
     except Exception:
-        raise HTTPException(status_code=400, detail="Failed to process .world JSON file.")
+        raise HTTPException(status_code=400, detail="Failed to process release. Verify both .world and .wsig files.")
 
 
 @app.post("/compare-two-files")
