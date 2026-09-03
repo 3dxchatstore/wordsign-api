@@ -97,14 +97,10 @@ def get_keys():
     return private_key, private_key.public_key()
 
 
-def extract_fingerprints(world_data: dict):
-    """
-    Extracts two-layer 3D fingerprints:
-    1. Shape-Only FP (Basic architecture blocks)
-    2. Full Map FP (All items including furniture)
-    Applies Bounding-Box Centering and Scale Normalization.
-    """
+def extract_item_list(world_data: dict):
+    """Extracts raw 3D item entries from nested world JSON."""
     raw_items = []
+    shape_keywords = {"box", "cube", "sphere", "cylinder", "triangle", "cone", "pyramid", "plane", "quad", "prism"}
 
     def parse_num(val):
         try:
@@ -134,7 +130,14 @@ def extract_fingerprints(world_data: dict):
                             break
 
             if x is not None and y is not None and z is not None and obj_name.lower() != "group":
-                raw_items.append({"name": obj_name, "x": x, "y": y, "z": z})
+                is_shape = obj_name.lower() in shape_keywords
+                raw_items.append({
+                    "name": obj_name.lower(),
+                    "x": round(x, 2),
+                    "y": round(y, 2),
+                    "z": round(z, 2),
+                    "is_shape": is_shape
+                })
 
             for v in node.values():
                 scan_node(v)
@@ -144,56 +147,66 @@ def extract_fingerprints(world_data: dict):
                 scan_node(item)
 
     scan_node(world_data)
-
-    if not raw_items:
-        return set(), set(), 0, 0
-
-    # Calculate bounding box for center calculation
-    xs = [i["x"] for i in raw_items]
-    ys = [i["y"] for i in raw_items]
-    zs = [i["z"] for i in raw_items]
-
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    min_z, max_z = min(zs), max(zs)
-
-    cx = (min_x + max_x) / 2.0
-    cy = (min_y + max_y) / 2.0
-    cz = (min_z + max_z) / 2.0
-
-    # Max dimension for scale normalization
-    max_dim = max(max_x - min_x, max_y - min_y, max_z - min_z)
-    if max_dim <= 0.0001:
-        max_dim = 1.0
-
-    shapes_fp = set()
-    all_fp = set()
-
-    shape_keywords = {"box", "cube", "sphere", "cylinder", "triangle", "cone", "pyramid", "plane", "quad", "prism"}
-    shapes_count = 0
-
-    for item in raw_items:
-        # Centered and normalized coordinates (rounded to 2 decimal places)
-        rx = round((item["x"] - cx) / max_dim, 2)
-        ry = round((item["y"] - cy) / max_dim, 2)
-        rz = round((item["z"] - cz) / max_dim, 2)
-
-        token = f"{item['name'].lower()}_{rx}_{ry}_{rz}"
-        all_fp.add(token)
-
-        if item["name"].lower() in shape_keywords:
-            shapes_fp.add(token)
-            shapes_count += 1
-
-    return shapes_fp, all_fp, shapes_count, len(raw_items)
+    return raw_items
 
 
-def compute_similarity(set_a: set, set_b: set) -> float:
-    if not set_a or not set_b:
-        return 0.0
-    shared = len(set_a.intersection(set_b))
-    total = len(set_a.union(set_b))
-    return (shared / total) if total > 0 else 0.0
+def match_sets_with_delta_alignment(list_a, list_b):
+    """
+    Finds the dominant translation vector between two item sets
+    and measures spatial overlap regardless of movement or partial deletions.
+    """
+    if not list_a or not list_b:
+        return 0, 0
+
+    delta_counts = {}
+    sample_a = list_a[:300]
+    sample_b = list_b[:300]
+
+    b_by_name = {}
+    for item in sample_b:
+        b_by_name.setdefault(item["name"], []).append(item)
+
+    for a in sample_a:
+        matches = b_by_name.get(a["name"], [])
+        for b in matches:
+            dx = round(b["x"] - a["x"], 1)
+            dy = round(b["y"] - a["y"], 1)
+            dz = round(b["z"] - a["z"], 1)
+            key = (dx, dy, dz)
+            delta_counts[key] = delta_counts.get(key, 0) + 1
+
+    if not delta_counts:
+        return 0, 0
+
+    best_dx, best_dy, best_dz = max(delta_counts, key=delta_counts.get)
+
+    set_a_tokens = {f"{i['name']}_{i['x']}_{i['y']}_{i['z']}" for i in list_a}
+    shared_count = 0
+
+    for b in list_b:
+        shifted_x = round(b["x"] - best_dx, 2)
+        shifted_y = round(b["y"] - best_dy, 2)
+        shifted_z = round(b["z"] - best_dz, 2)
+
+        matched = False
+        for dx in (-0.1, 0.0, 0.1):
+            for dy in (-0.1, 0.0, 0.1):
+                for dz in (-0.1, 0.0, 0.1):
+                    tok = f"{b['name']}_{round(shifted_x+dx, 2)}_{round(shifted_y+dy, 2)}_{round(shifted_z+dz, 2)}"
+                    if tok in set_a_tokens:
+                        matched = True
+                        break
+                if matched:
+                    break
+            if matched:
+                break
+
+        if matched:
+            shared_count += 1
+
+    max_len = max(len(list_a), len(list_b))
+    score = (shared_count / max_len) if max_len > 0 else 0.0
+    return int(score * 100), shared_count
 
 
 @app.get("/stats")
@@ -256,30 +269,29 @@ async def sign_world(
     if not final_author:
         final_author = "Unknown"
 
-    shapes_fp, all_fp, shapes_cnt, total_cnt = extract_fingerprints(world_data)
+    items_current = extract_item_list(world_data)
+    shapes_current = [i for i in items_current if i["is_shape"]]
     stored_fps = load_fingerprints()
 
-    # Two-layer background database scan
-    if not is_update and not force_register and (shapes_fp or all_fp):
+    if not is_update and not force_register and items_current:
         for entry in stored_fps:
-            prev_shapes = set(entry.get("shapes_fp", []))
-            prev_all = set(entry.get("all_fp", entry.get("fp", [])))
+            prev_all = entry.get("items", [])
+            prev_shapes = [i for i in prev_all if i.get("is_shape")]
 
-            score_shapes = compute_similarity(shapes_fp, prev_shapes)
-            score_all = compute_similarity(all_fp, prev_all)
-            highest_score = max(score_shapes, score_all)
+            s_pct, _ = match_sets_with_delta_alignment(shapes_current, prev_shapes)
+            a_pct, _ = match_sets_with_delta_alignment(items_current, prev_all)
+            highest_score = max(s_pct, a_pct)
 
-            if highest_score >= 0.80:
-                match_pct = int(highest_score * 100)
+            if highest_score >= 80:
                 orig_title = entry.get("title", "Untitled")
                 orig_author = entry.get("author", "Unknown")
                 return Response(
                     content=json.dumps({
                         "similarity_warning": True,
-                        "match_percentage": match_pct,
+                        "match_percentage": highest_score,
                         "matched_title": orig_title,
                         "matched_author": orig_author,
-                        "message": f"A similar file with {match_pct}% layout similarity has been uploaded before ('{orig_title}' by {orig_author})."
+                        "message": f"A similar file with {highest_score}% layout similarity has been uploaded before ('{orig_title}' by {orig_author})."
                     }),
                     status_code=200,
                     media_type="application/json"
@@ -299,12 +311,11 @@ async def sign_world(
 
     signed_json_bytes = json.dumps(world_data, indent=2).encode("utf-8")
 
-    if all_fp:
+    if items_current:
         stored_fps.insert(0, {
             "title": world_title or "Untitled",
             "author": final_author,
-            "shapes_fp": list(shapes_fp),
-            "all_fp": list(all_fp)
+            "items": items_current
         })
         save_fingerprints(stored_fps)
 
@@ -407,22 +418,23 @@ async def compare_two_files(
     except Exception:
         raise HTTPException(status_code=400, detail="One or both files are invalid .world JSON.")
 
-    shapes_a, all_a, shapes_cnt_a, total_cnt_a = extract_fingerprints(data_a)
-    shapes_b, all_b, shapes_cnt_b, total_cnt_b = extract_fingerprints(data_b)
+    items_a = extract_item_list(data_a)
+    items_b = extract_item_list(data_b)
 
-    score_shapes = compute_similarity(shapes_a, shapes_b)
-    score_all = compute_similarity(all_a, all_b)
+    shapes_a = [i for i in items_a if i["is_shape"]]
+    shapes_b = [i for i in items_b if i["is_shape"]]
 
-    shapes_pct = int(score_shapes * 100)
-    all_pct = int(score_all * 100)
+    shapes_pct, shared_shapes = match_sets_with_delta_alignment(shapes_a, shapes_b)
+    all_pct, shared_all = match_sets_with_delta_alignment(items_a, items_b)
+
     highest_pct = max(shapes_pct, all_pct)
 
     return {
         "highest_match_percentage": highest_pct,
         "shapes_match_percentage": shapes_pct,
         "all_match_percentage": all_pct,
-        "file_a": {"shapes": shapes_cnt_a, "total": total_cnt_a},
-        "file_b": {"shapes": shapes_cnt_b, "total": total_cnt_b},
-        "shared_shapes": len(shapes_a.intersection(shapes_b)),
-        "shared_all": len(all_a.intersection(all_b))
+        "file_a": {"shapes": len(shapes_a), "total": len(items_a)},
+        "file_b": {"shapes": len(shapes_b), "total": len(items_b)},
+        "shared_shapes": shared_shapes,
+        "shared_all": shared_all
     }
