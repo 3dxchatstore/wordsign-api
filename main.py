@@ -1,6 +1,8 @@
 import os
 import json
 import struct
+import io
+import zipfile
 import hashlib
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import Response
@@ -23,6 +25,7 @@ FOOTER_TAG = b"WORLDSIGN_V2"
 SIGNATURE_SIZE = 256
 STATS_FILE = "stats.json"
 
+
 def load_stats():
     if os.path.exists(STATS_FILE):
         try:
@@ -39,6 +42,7 @@ def load_stats():
             pass
     return {"protected": 0, "verified": 0, "tampered": 0, "authors": set(), "history": []}
 
+
 def save_stats():
     try:
         with open(STATS_FILE, "w") as f:
@@ -47,12 +51,14 @@ def save_stats():
                 "verified": stats_data["verified"],
                 "tampered": stats_data["tampered"],
                 "authors": list(stats_data["authors"]),
-                "history": stats_data["history"][:20]  # Keep last 20 entries
+                "history": stats_data["history"][:20]
             }, f)
     except Exception:
         pass
 
+
 stats_data = load_stats()
+
 
 def get_keys():
     pem_key = os.getenv("PRIVATE_KEY")
@@ -61,36 +67,41 @@ def get_keys():
     private_key = load_pem_private_key(pem_key.encode("utf-8"), password=None)
     return private_key, private_key.public_key()
 
-def parse_footer(file_bytes):
-    tag_len = len(FOOTER_TAG)
-    if len(file_bytes) <= (tag_len + SIGNATURE_SIZE + 4):
-        return None, None, None
-    if file_bytes[-tag_len:] != FOOTER_TAG:
-        return None, None, None
 
-    sig_start = len(file_bytes) - tag_len - SIGNATURE_SIZE
-    signature = file_bytes[sig_start:-tag_len]
-    meta_len_start = sig_start - 4
-    meta_len = struct.unpack(">I", file_bytes[meta_len_start:sig_start])[0]
-    meta_start = meta_len_start - meta_len
-
-    if meta_start < 0:
-        return None, None, None
-
-    metadata_bytes = file_bytes[meta_start:meta_len_start]
-    raw_content = file_bytes[:meta_start]
-
+def parse_zip_comment(file_bytes):
+    """Extracts metadata and signature from the ZIP comment field without breaking game compatibility."""
     try:
-        metadata = json.loads(metadata_bytes.decode("utf-8"))
-    except Exception:
-        metadata = {}
+        in_mem = io.BytesIO(file_bytes)
+        with zipfile.ZipFile(in_mem, "r") as zf:
+            comment = zf.comment
+            tag_len = len(FOOTER_TAG)
+            if len(comment) > (tag_len + SIGNATURE_SIZE + 4):
+                if comment[-tag_len:] == FOOTER_TAG:
+                    sig_start = len(comment) - tag_len - SIGNATURE_SIZE
+                    signature = comment[sig_start:-tag_len]
+                    meta_len_start = sig_start - 4
+                    meta_len = struct.unpack(">I", comment[meta_len_start:sig_start])[0]
+                    meta_start = meta_len_start - meta_len
 
-    return raw_content, metadata, signature
+                    if meta_start >= 0:
+                        metadata_bytes = comment[meta_start:meta_len_start]
+                        metadata = json.loads(metadata_bytes.decode("utf-8"))
+
+                        # Return clean un-commented zip bytes for signature verification
+                        out_mem = io.BytesIO()
+                        with zipfile.ZipFile(out_mem, "w") as z_out:
+                            for item in zf.infolist():
+                                z_out.writestr(item, zf.read(item.filename))
+                            z_out.comment = b""
+                        return out_mem.getvalue(), metadata, signature
+    except Exception:
+        pass
+    return None, None, None
+
 
 @app.get("/stats")
 def get_stats():
     _, public_key = get_keys()
-    
     pub_pem = public_key.public_bytes(
         encoding=Encoding.PEM,
         format=PublicFormat.SubjectPublicKeyInfo
@@ -106,6 +117,7 @@ def get_stats():
         "public_key": pub_pem,
         "history": stats_data["history"]
     }
+
 
 @app.post("/sign")
 async def sign_world(
@@ -132,6 +144,7 @@ async def sign_world(
     meta_json = json.dumps(metadata).encode("utf-8")
     meta_len = len(meta_json)
 
+    # Sign base zip bytes + metadata
     data_to_sign = original_bytes + meta_json
     signature = private_key.sign(
         data_to_sign,
@@ -139,7 +152,21 @@ async def sign_world(
         hashes.SHA256()
     )
 
-    signed_bytes = original_bytes + meta_json + struct.pack(">I", meta_len) + signature + FOOTER_TAG
+    payload = meta_json + struct.pack(">I", meta_len) + signature + FOOTER_TAG
+
+    # Inject signature into ZIP comment field
+    try:
+        in_mem = io.BytesIO(original_bytes)
+        out_mem = io.BytesIO()
+        with zipfile.ZipFile(in_mem, "r") as z_in:
+            with zipfile.ZipFile(out_mem, "w") as z_out:
+                for item in z_in.infolist():
+                    z_out.writestr(item, z_in.read(item.filename))
+                z_out.comment = payload
+        signed_bytes = out_mem.getvalue()
+    except Exception:
+        # Fallback raw append if not a standard ZIP archive
+        signed_bytes = original_bytes + payload
 
     # Update stats & history log
     stats_data["protected"] += 1
@@ -159,12 +186,13 @@ async def sign_world(
         headers={"Content-Disposition": f"attachment; filename=signed_{file.filename}"}
     )
 
+
 @app.post("/verify")
 async def verify_world(file: UploadFile = File(...)):
     _, public_key = get_keys()
     file_bytes = await file.read()
 
-    raw_content, metadata, signature = parse_footer(file_bytes)
+    raw_content, metadata, signature = parse_zip_comment(file_bytes)
     if not signature:
         stats_data["tampered"] += 1
         save_stats()
@@ -194,15 +222,15 @@ async def verify_world(file: UploadFile = File(...)):
         save_stats()
         return {"status": "tampered", "message": "File modified! Signature check failed."}
 
+
 @app.post("/release")
 async def release_ownership(
     file: UploadFile = File(...),
     passphrase: str = Form("")
 ):
-    _, public_key = get_keys()
     file_bytes = await file.read()
 
-    raw_content, metadata, signature = parse_footer(file_bytes)
+    raw_content, metadata, signature = parse_zip_comment(file_bytes)
     if not signature:
         raise HTTPException(status_code=400, detail="File is not signed.")
 
