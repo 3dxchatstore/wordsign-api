@@ -152,8 +152,8 @@ def extract_item_list(world_data: dict):
 
 def match_sets_with_delta_alignment(list_a, list_b):
     """
-    Scans entire map structure using global translation sampling
-    to detect matches even with movement and heavy partial deletions.
+    Scans map structure using delta translation sampling.
+    Evaluates relative to min(len_A, len_B) to capture both partial deletions and decor additions.
     """
     if not list_a or not list_b:
         return 0, 0
@@ -162,7 +162,6 @@ def match_sets_with_delta_alignment(list_a, list_b):
     for item in list_b:
         b_by_name.setdefault(item["name"], []).append(item)
 
-    # Sample items evenly across the entire length of list_a
     step = max(1, len(list_a) // 150)
     sample_a = list_a[::step]
 
@@ -181,7 +180,6 @@ def match_sets_with_delta_alignment(list_a, list_b):
 
     best_dx, best_dy, best_dz = max(delta_counts, key=delta_counts.get)
 
-    # Build 10cm grid spatial index for list_a
     a_spatial = set()
     for a in list_a:
         a_spatial.add((a["name"], round(a["x"], 1), round(a["y"], 1), round(a["z"], 1)))
@@ -216,8 +214,9 @@ def match_sets_with_delta_alignment(list_a, list_b):
         if matched:
             shared_count += 1
 
-    max_len = max(len(list_a), len(list_b))
-    score = (shared_count / max_len) if max_len > 0 else 0.0
+    # Evaluates against min_len to maximize protection against both deletions and spammed decor
+    min_len = min(len(list_a), len(list_b))
+    score = (shared_count / min_len) if min_len > 0 else 0.0
     return int(score * 100), shared_count
 
 
