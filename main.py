@@ -21,14 +21,38 @@ app.add_middleware(
 
 FOOTER_TAG = b"WORLDSIGN_V2"
 SIGNATURE_SIZE = 256
+STATS_FILE = "stats.json"
 
-# Memory storage for live stats
-stats_data = {
-    "protected": 0,
-    "verified": 0,
-    "tampered": 0,
-    "authors": set()  # Stores unique author names
-}
+# Helper functions to save and load counters permanently to disk
+def load_stats():
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, "r") as f:
+                data = json.load(f)
+                return {
+                    "protected": data.get("protected", 0),
+                    "verified": data.get("verified", 0),
+                    "tampered": data.get("tampered", 0),
+                    "authors": set(data.get("authors", []))
+                }
+        except Exception:
+            pass
+    return {"protected": 0, "verified": 0, "tampered": 0, "authors": set()}
+
+def save_stats():
+    try:
+        with open(STATS_FILE, "w") as f:
+            json.dump({
+                "protected": stats_data["protected"],
+                "verified": stats_data["verified"],
+                "tampered": stats_data["tampered"],
+                "authors": list(stats_data["authors"])
+            }, f)
+    except Exception:
+        pass
+
+# Initialize persistent memory
+stats_data = load_stats()
 
 
 def get_keys():
@@ -70,7 +94,6 @@ def parse_footer(file_bytes):
 def get_stats():
     _, public_key = get_keys()
     
-    # Export public key as text string
     pub_pem = public_key.public_bytes(
         encoding=Encoding.PEM,
         format=PublicFormat.SubjectPublicKeyInfo
@@ -99,17 +122,9 @@ async def sign_world(
     private_key, _ = get_keys()
     original_bytes = await file.read()
 
-    # 1. Parse .world file as valid JSON
-    try:
-        world_data = json.loads(original_bytes.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid .world JSON file")
-
-    # 2. Hash passphrase
     pass_hash = hashlib.sha256(passphrase.encode()).hexdigest() if passphrase else ""
 
-    # 3. Inject metadata inside the JSON structure
-    world_data["_ProtectionRegistry"] = {
+    metadata = {
         "world_title": world_title,
         "author_name": author_name,
         "contact": contact,
@@ -117,40 +132,65 @@ async def sign_world(
         "passphrase_hash": pass_hash
     }
 
-    # 4. Convert clean JSON back to bytes
-    signed_json_bytes = json.dumps(world_data, indent=2).encode("utf-8")
+    meta_json = json.dumps(metadata).encode("utf-8")
+    meta_len = len(meta_json)
 
-    # 5. Update stats
+    data_to_sign = original_bytes + meta_json
+    signature = private_key.sign(
+        data_to_sign,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+        hashes.SHA256()
+    )
+
+    signed_bytes = original_bytes + meta_json + struct.pack(">I", meta_len) + signature + FOOTER_TAG
+
+    # Update memory & save file
     stats_data["protected"] += 1
-    if author_name:
-        stats_data["authors"].add(author_name)
+    if author_name.strip():
+        stats_data["authors"].add(author_name.strip().lower())
+    save_stats()
 
-    return Response(content=signed_json_bytes, media_type="application/octet-stream")
-    
+    return Response(
+        content=signed_bytes,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename=signed_{file.filename}"}
+    )
+
+
 @app.post("/verify")
 async def verify_world(file: UploadFile = File(...)):
+    _, public_key = get_keys()
     file_bytes = await file.read()
 
+    raw_content, metadata, signature = parse_footer(file_bytes)
+    if not signature:
+        stats_data["tampered"] += 1
+        save_stats()
+        return {"status": "unsigned", "message": "No WorldSign digital seal detected."}
+
+    meta_json = json.dumps(metadata).encode("utf-8")
+    data_to_verify = raw_content + meta_json
+
     try:
-        world_data = json.loads(file_bytes.decode("utf-8"))
-        registry = world_data.get("_ProtectionRegistry")
-
-        if registry:
-            stats_data["verified"] += 1
-            return {
-                "status": "authentic",
-                "message": "Signature is valid and registered!",
-                "world_title": registry.get("world_title", "Untitled"),
-                "author_name": registry.get("author_name", "Unknown"),
-                "copy_label": registry.get("copy_label", "N/A")
-            }
-        else:
-            stats_data["tampered"] += 1
-            return {"status": "unsigned", "message": "No WorldSign digital seal detected."}
-
+        public_key.verify(
+            signature,
+            data_to_verify,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256()
+        )
+        stats_data["verified"] += 1
+        save_stats()
+        return {
+            "status": "authentic",
+            "message": "Signature is valid and registered!",
+            "world_title": metadata.get("world_title", "Untitled"),
+            "author_name": metadata.get("author_name", "Unknown"),
+            "copy_label": metadata.get("copy_label", "N/A")
+        }
     except Exception:
         stats_data["tampered"] += 1
-        return {"status": "tampered", "message": "File modified! Verification failed."}
+        save_stats()
+        return {"status": "tampered", "message": "File modified! Signature check failed."}
 
 
 @app.post("/release")
