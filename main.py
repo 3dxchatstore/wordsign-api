@@ -22,11 +22,12 @@ app.add_middleware(
 FOOTER_TAG = b"WORLDSIGN_V2"
 SIGNATURE_SIZE = 256
 
-# In-memory counter storage
-counters = {
+# Memory storage for live stats
+stats_data = {
     "protected": 0,
     "verified": 0,
-    "tampered": 0
+    "tampered": 0,
+    "authors": set()  # Stores unique author names
 }
 
 
@@ -67,17 +68,21 @@ def parse_footer(file_bytes):
 
 @app.get("/stats")
 def get_stats():
-    """Returns current counter totals and the public RSA key string."""
     _, public_key = get_keys()
     
-    # Export public key as PEM text string
+    # Export public key as text string
     pub_pem = public_key.public_bytes(
         encoding=Encoding.PEM,
         format=PublicFormat.SubjectPublicKeyInfo
     ).decode("utf-8")
 
     return {
-        "counters": counters,
+        "counters": {
+            "protected": stats_data["protected"],
+            "verified": stats_data["verified"],
+            "tampered": stats_data["tampered"],
+            "authors": len(stats_data["authors"])
+        },
         "public_key": pub_pem
     }
 
@@ -116,8 +121,10 @@ async def sign_world(
 
     signed_bytes = original_bytes + meta_json + struct.pack(">I", meta_len) + signature + FOOTER_TAG
 
-    # Increment counter
-    counters["protected"] += 1
+    # Update counters
+    stats_data["protected"] += 1
+    if author_name.strip():
+        stats_data["authors"].add(author_name.strip().lower())
 
     return Response(
         content=signed_bytes,
@@ -133,7 +140,7 @@ async def verify_world(file: UploadFile = File(...)):
 
     raw_content, metadata, signature = parse_footer(file_bytes)
     if not signature:
-        counters["tampered"] += 1
+        stats_data["tampered"] += 1
         return {"status": "unsigned", "message": "No WorldSign digital seal detected."}
 
     meta_json = json.dumps(metadata).encode("utf-8")
@@ -146,7 +153,7 @@ async def verify_world(file: UploadFile = File(...)):
             padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
             hashes.SHA256()
         )
-        counters["verified"] += 1
+        stats_data["verified"] += 1
         return {
             "status": "authentic",
             "message": "Signature is valid and registered!",
@@ -155,5 +162,30 @@ async def verify_world(file: UploadFile = File(...)):
             "copy_label": metadata.get("copy_label", "N/A")
         }
     except Exception:
-        counters["tampered"] += 1
+        stats_data["tampered"] += 1
         return {"status": "tampered", "message": "File modified! Signature check failed."}
+
+
+@app.post("/release")
+async def release_ownership(
+    file: UploadFile = File(...),
+    passphrase: str = Form("")
+):
+    _, public_key = get_keys()
+    file_bytes = await file.read()
+
+    raw_content, metadata, signature = parse_footer(file_bytes)
+    if not signature:
+        raise HTTPException(status_code=400, detail="File is not signed.")
+
+    stored_hash = metadata.get("passphrase_hash", "")
+    if stored_hash:
+        input_hash = hashlib.sha256(passphrase.encode()).hexdigest()
+        if input_hash != stored_hash:
+            raise HTTPException(status_code=401, detail="Incorrect passphrase.")
+
+    return Response(
+        content=raw_content,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename=released_{file.filename}"}
+    )
