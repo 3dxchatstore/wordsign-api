@@ -133,9 +133,9 @@ def extract_item_list(world_data: dict):
                 is_shape = obj_name.lower() in shape_keywords
                 raw_items.append({
                     "name": obj_name.lower(),
-                    "x": round(x, 2),
-                    "y": round(y, 2),
-                    "z": round(z, 2),
+                    "x": float(x),
+                    "y": float(y),
+                    "z": float(z),
                     "is_shape": is_shape
                 })
 
@@ -152,20 +152,21 @@ def extract_item_list(world_data: dict):
 
 def match_sets_with_delta_alignment(list_a, list_b):
     """
-    Finds the dominant translation vector between two item sets
-    and measures spatial overlap regardless of movement or partial deletions.
+    Scans entire map structure using global translation sampling
+    to detect matches even with movement and heavy partial deletions.
     """
     if not list_a or not list_b:
         return 0, 0
 
-    delta_counts = {}
-    sample_a = list_a[:300]
-    sample_b = list_b[:300]
-
     b_by_name = {}
-    for item in sample_b:
+    for item in list_b:
         b_by_name.setdefault(item["name"], []).append(item)
 
+    # Sample items evenly across the entire length of list_a
+    step = max(1, len(list_a) // 150)
+    sample_a = list_a[::step]
+
+    delta_counts = {}
     for a in sample_a:
         matches = b_by_name.get(a["name"], [])
         for b in matches:
@@ -180,21 +181,32 @@ def match_sets_with_delta_alignment(list_a, list_b):
 
     best_dx, best_dy, best_dz = max(delta_counts, key=delta_counts.get)
 
-    set_a_tokens = {f"{i['name']}_{i['x']}_{i['y']}_{i['z']}" for i in list_a}
+    # Build 10cm grid spatial index for list_a
+    a_spatial = set()
+    for a in list_a:
+        a_spatial.add((a["name"], round(a["x"], 1), round(a["y"], 1), round(a["z"], 1)))
+
     shared_count = 0
+    matched_keys = set()
 
     for b in list_b:
-        shifted_x = round(b["x"] - best_dx, 2)
-        shifted_y = round(b["y"] - best_dy, 2)
-        shifted_z = round(b["z"] - best_dz, 2)
+        shifted_x = round(b["x"] - best_dx, 1)
+        shifted_y = round(b["y"] - best_dy, 1)
+        shifted_z = round(b["z"] - best_dz, 1)
 
         matched = False
         for dx in (-0.1, 0.0, 0.1):
             for dy in (-0.1, 0.0, 0.1):
                 for dz in (-0.1, 0.0, 0.1):
-                    tok = f"{b['name']}_{round(shifted_x+dx, 2)}_{round(shifted_y+dy, 2)}_{round(shifted_z+dz, 2)}"
-                    if tok in set_a_tokens:
+                    test_key = (
+                        b["name"],
+                        round(shifted_x + dx, 1),
+                        round(shifted_y + dy, 1),
+                        round(shifted_z + dz, 1)
+                    )
+                    if test_key in a_spatial and test_key not in matched_keys:
                         matched = True
+                        matched_keys.add(test_key)
                         break
                 if matched:
                     break
