@@ -124,7 +124,7 @@ def extract_fingerprint(world_data: dict) -> set:
 
 
 def compute_similarity(set_a: set, set_b: set) -> float:
-    """Calculates Jaccard similarity score between two fingerprint sets."""
+    """Calculates similarity score (0.0 to 1.0) between two room layouts."""
     if not set_a or not set_b:
         return 0.0
     shared = len(set_a.intersection(set_b))
@@ -191,7 +191,7 @@ async def sign_world(
     if not final_author:
         final_author = "Unknown"
 
-    # Fingerprint Similarity Checking for New Registrations
+    # Fingerprint Similarity Checking for New Registrations (Scenario 1)
     current_fp = extract_fingerprint(world_data)
     stored_fps = load_fingerprints()
 
@@ -210,7 +210,7 @@ async def sign_world(
                         "match_percentage": match_pct,
                         "matched_title": orig_title,
                         "matched_author": orig_author,
-                        "message": f"Warning: This layout is {match_pct}% identical to '{orig_title}' registered by {orig_author}."
+                        "message": f"A similar file with {match_pct}% structural similarity has been uploaded before ('{orig_title}' by {orig_author})."
                     }),
                     status_code=200,
                     media_type="application/json"
@@ -228,7 +228,7 @@ async def sign_world(
 
     signed_json_bytes = json.dumps(world_data, indent=2).encode("utf-8")
 
-    # Save new room fingerprint
+    # Save new room fingerprint to database
     if current_fp:
         stored_fps.insert(0, {
             "title": world_title or "Untitled",
@@ -237,7 +237,7 @@ async def sign_world(
         })
         save_fingerprints(stored_fps)
 
-    # Update stats
+    # Update global counters & activity log
     stats_data["protected"] += 1
     t_clean = world_title.strip() if world_title.strip() else "Untitled"
 
@@ -246,6 +246,7 @@ async def sign_world(
     stats_data["history"] = stats_data["history"][:20]
     save_stats()
 
+    # UTC Timestamped download filename
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SUTC")
     safe_author = final_author.replace(" ", "_")
     base_name = file.filename.replace(".world", "")
@@ -320,38 +321,35 @@ async def release_ownership(
     except Exception:
         raise HTTPException(status_code=400, detail="Failed to process .world JSON file.")
 
-@app.post("/check-similarity")
-async def check_similarity_only(file: UploadFile = File(...)):
-    file_bytes = await file.read()
+
+@app.post("/compare-two-files")
+async def compare_two_files(
+    file_a: UploadFile = File(...),
+    file_b: UploadFile = File(...)
+):
+    """Direct 1-vs-1 compare endpoint (Scenario 2)."""
+    bytes_a = await file_a.read()
+    bytes_b = await file_b.read()
 
     try:
-        world_data = json.loads(file_bytes.decode("utf-8"))
+        data_a = json.loads(bytes_a.decode("utf-8"))
+        data_b = json.loads(bytes_b.decode("utf-8"))
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid .world JSON file.")
+        raise HTTPException(status_code=400, detail="One or both files are invalid .world JSON.")
 
-    current_fp = extract_fingerprint(world_data)
-    if not current_fp:
-        return {"matches": [], "message": "No layout objects found in this room."}
+    fp_a = extract_fingerprint(data_a)
+    fp_b = extract_fingerprint(data_b)
 
-    stored_fps = load_fingerprints()
-    results = []
+    if not fp_a or not fp_b:
+        return {"match_percentage": 0, "file_a_objects": len(fp_a), "file_b_objects": len(fp_b), "shared_objects": 0}
 
-    for entry in stored_fps:
-        prev_fp = set(entry.get("fp", []))
-        score = compute_similarity(current_fp, prev_fp)
-        
-        # Report matches that have 15% or higher layout overlap
-        if score >= 0.15:
-            results.append({
-                "title": entry.get("title", "Untitled"),
-                "author": entry.get("author", "Unknown"),
-                "match_percentage": int(score * 100)
-            })
-
-    # Sort matches by highest percentage first
-    results.sort(key=lambda x: x["match_percentage"], reverse=True)
+    score = compute_similarity(fp_a, fp_b)
+    match_pct = int(score * 100)
+    shared_count = len(fp_a.intersection(fp_b))
 
     return {
-        "total_objects_scanned": len(current_fp),
-        "matches": results[:5]  # Return top 5 highest matches
+        "match_percentage": match_pct,
+        "file_a_objects": len(fp_a),
+        "file_b_objects": len(fp_b),
+        "shared_objects": shared_count
     }
