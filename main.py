@@ -23,7 +23,6 @@ FOOTER_TAG = b"WORLDSIGN_V2"
 SIGNATURE_SIZE = 256
 STATS_FILE = "stats.json"
 
-# Helper functions to save and load counters permanently to disk
 def load_stats():
     if os.path.exists(STATS_FILE):
         try:
@@ -33,11 +32,12 @@ def load_stats():
                     "protected": data.get("protected", 0),
                     "verified": data.get("verified", 0),
                     "tampered": data.get("tampered", 0),
-                    "authors": set(data.get("authors", []))
+                    "authors": set(data.get("authors", [])),
+                    "history": data.get("history", [])
                 }
         except Exception:
             pass
-    return {"protected": 0, "verified": 0, "tampered": 0, "authors": set()}
+    return {"protected": 0, "verified": 0, "tampered": 0, "authors": set(), "history": []}
 
 def save_stats():
     try:
@@ -46,14 +46,13 @@ def save_stats():
                 "protected": stats_data["protected"],
                 "verified": stats_data["verified"],
                 "tampered": stats_data["tampered"],
-                "authors": list(stats_data["authors"])
+                "authors": list(stats_data["authors"]),
+                "history": stats_data["history"][:20]  # Keep last 20 entries
             }, f)
     except Exception:
         pass
 
-# Initialize persistent memory
 stats_data = load_stats()
-
 
 def get_keys():
     pem_key = os.getenv("PRIVATE_KEY")
@@ -61,7 +60,6 @@ def get_keys():
         raise HTTPException(status_code=500, detail="PRIVATE_KEY missing on server.")
     private_key = load_pem_private_key(pem_key.encode("utf-8"), password=None)
     return private_key, private_key.public_key()
-
 
 def parse_footer(file_bytes):
     tag_len = len(FOOTER_TAG)
@@ -89,7 +87,6 @@ def parse_footer(file_bytes):
 
     return raw_content, metadata, signature
 
-
 @app.get("/stats")
 def get_stats():
     _, public_key = get_keys()
@@ -106,9 +103,9 @@ def get_stats():
             "tampered": stats_data["tampered"],
             "authors": len(stats_data["authors"])
         },
-        "public_key": pub_pem
+        "public_key": pub_pem,
+        "history": stats_data["history"]
     }
-
 
 @app.post("/sign")
 async def sign_world(
@@ -144,10 +141,16 @@ async def sign_world(
 
     signed_bytes = original_bytes + meta_json + struct.pack(">I", meta_len) + signature + FOOTER_TAG
 
-    # Update memory & save file
+    # Update stats & history log
     stats_data["protected"] += 1
+    t_clean = world_title.strip() if world_title.strip() else "Untitled"
+    a_clean = author_name.strip() if author_name.strip() else "Anonymous"
+
     if author_name.strip():
         stats_data["authors"].add(author_name.strip().lower())
+
+    stats_data["history"].insert(0, {"title": t_clean, "author": a_clean})
+    stats_data["history"] = stats_data["history"][:20]
     save_stats()
 
     return Response(
@@ -155,7 +158,6 @@ async def sign_world(
         media_type="application/octet-stream",
         headers={"Content-Disposition": f"attachment; filename=signed_{file.filename}"}
     )
-
 
 @app.post("/verify")
 async def verify_world(file: UploadFile = File(...)):
@@ -191,7 +193,6 @@ async def verify_world(file: UploadFile = File(...)):
         stats_data["tampered"] += 1
         save_stats()
         return {"status": "tampered", "message": "File modified! Signature check failed."}
-
 
 @app.post("/release")
 async def release_ownership(
