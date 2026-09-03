@@ -1,144 +1,162 @@
 import os
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import Response
+import json
+import struct
+import hashlib
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
-# Initialize the backend server
-app = FastAPI(title="WorldSign Security API")
+app = FastAPI(title="WorldSign API")
 
-# Security Rule: Allow your WordPress site to send upload requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://3dxchatstore.com",       # REPLACE with your real WordPress website URL
-        "https://www.3dxchatstore.com",   # Include www version if your site uses it
-    ],
+    allow_origins=["*"],  # Update with your domain for tighter security
     allow_credentials=True,
-    allow_methods=["*"],                # Allows file uploads and downloads
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Unique markers used to attach the digital seal to .world files
-FOOTER_TAG = b"WORLDSIGN_V1"
-SIGNATURE_SIZE = 256  # RSA 2048-bit signatures are 256 bytes
-FOOTER_TOTAL_SIZE = SIGNATURE_SIZE + len(FOOTER_TAG)
+FOOTER_TAG = b"WORLDSIGN_V2"
+SIGNATURE_SIZE = 256
 
 
 def get_keys():
-    """Fetches the private key stored safely in Railway settings."""
-    pem_private_key = os.getenv("PRIVATE_KEY")
-    if not pem_private_key:
-        raise HTTPException(
-            status_code=500, 
-            detail="Server error: PRIVATE_KEY environment variable is missing on Railway."
-        )
+    pem_key = os.getenv("PRIVATE_KEY")
+    if not pem_key:
+        raise HTTPException(status_code=500, detail="PRIVATE_KEY missing on server.")
+    private_key = load_pem_private_key(pem_key.encode("utf-8"), password=None)
+    return private_key, private_key.public_key()
+
+
+def parse_footer(file_bytes):
+    """Extracts raw map content, JSON metadata, and signature from the file bytes."""
+    tag_len = len(FOOTER_TAG)
+    if len(file_bytes) <= (tag_len + SIGNATURE_SIZE + 4):
+        return None, None, None
+
+    if file_bytes[-tag_len:] != FOOTER_TAG:
+        return None, None, None
+
+    # Read signature bytes
+    sig_start = len(file_bytes) - tag_len - SIGNATURE_SIZE
+    signature = file_bytes[sig_start:-tag_len]
+
+    # Read metadata length (4 bytes integer)
+    meta_len_start = sig_start - 4
+    meta_len = struct.unpack(">I", file_bytes[meta_len_start:sig_start])[0]
+
+    # Read metadata JSON
+    meta_start = meta_len_start - meta_len
+    if meta_start < 0:
+        return None, None, None
+
+    metadata_bytes = file_bytes[meta_start:meta_len_start]
+    raw_content = file_bytes[:meta_start]
 
     try:
-        # Load the private key from Railway memory
-        private_key = load_pem_private_key(
-            pem_private_key.encode("utf-8"), 
-            password=None
-        )
-        # Automatically generate the matching public key to check signatures
-        public_key = private_key.public_key()
-        return private_key, public_key
-    except Exception as err:
-        raise HTTPException(status_code=500, detail=f"Invalid RSA key format: {str(err)}")
+        metadata = json.loads(metadata_bytes.decode("utf-8"))
+    except Exception:
+        metadata = {}
 
-
-@app.get("/")
-def health_check():
-    """Simple check to make sure your API server is running."""
-    return {"status": "WorldSign API is active and running!"}
+    return raw_content, metadata, signature
 
 
 @app.post("/sign")
-async def sign_world_file(file: UploadFile = File(...)):
-    """
-    STATION 1: Stamping endpoint
-    Takes a vendor's .world file, calculates a digital seal using your private key,
-    attaches the seal to the end of the file, and lets the vendor download it.
-    """
+async def sign_world(
+    file: UploadFile = File(...),
+    world_title: str = Form(""),
+    author_name: str = Form(""),
+    contact: str = Form(""),
+    copy_label: str = Form(""),
+    passphrase: str = Form("")
+):
     private_key, _ = get_keys()
-    
-    # Read the contents of the uploaded file
     original_bytes = await file.read()
-    if not original_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-    # Create the cryptographic digital signature
+    pass_hash = hashlib.sha256(passphrase.encode()).hexdigest() if passphrase else ""
+
+    metadata = {
+        "world_title": world_title,
+        "author_name": author_name,
+        "contact": contact,
+        "copy_label": copy_label,
+        "passphrase_hash": pass_hash
+    }
+
+    meta_json = json.dumps(metadata).encode("utf-8")
+    meta_len = len(meta_json)
+
+    # Data to sign = raw world bytes + metadata bytes
+    data_to_sign = original_bytes + meta_json
     signature = private_key.sign(
-        original_bytes,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH
-        ),
+        data_to_sign,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
         hashes.SHA256()
     )
 
-    # Attach the signature and marker tag to the end of the map file
-    signed_file_bytes = original_bytes + signature + FOOTER_TAG
+    signed_bytes = original_bytes + meta_json + struct.pack(">I", meta_len) + signature + FOOTER_TAG
 
-    # Return the newly stamped file back to the browser for download
     return Response(
-        content=signed_file_bytes,
+        content=signed_bytes,
         media_type="application/octet-stream",
-        headers={
-            "Content-Disposition": f"attachment; filename=signed_{file.filename}"
-        }
+        headers={"Content-Disposition": f"attachment; filename=signed_{file.filename}"}
     )
 
 
 @app.post("/verify")
-async def verify_world_file(file: UploadFile = File(...)):
-    """
-    STATION 2: Audit endpoint
-    Scans a suspect .world file, checks if the digital seal is present,
-    and confirms if any blocks/bytes inside were changed.
-    """
+async def verify_world(file: UploadFile = File(...)):
     _, public_key = get_keys()
-
     file_bytes = await file.read()
-    
-    # Check if file is too small to contain our digital signature
-    if len(file_bytes) <= FOOTER_TOTAL_SIZE:
-        return {
-            "status": "invalid",
-            "message": "File is missing digital signature or is corrupted."
-        }
 
-    # Read the last few bytes to see if our marker tag is present
-    extracted_tag = file_bytes[-len(FOOTER_TAG):]
-    if extracted_tag != FOOTER_TAG:
-        return {
-            "status": "unsigned",
-            "message": "No WorldSign digital seal detected on this file."
-        }
+    raw_content, metadata, signature = parse_footer(file_bytes)
+    if not signature:
+        return {"status": "unsigned", "message": "No WorldSign digital seal detected."}
 
-    # Separate the map data from the digital seal
-    original_content = file_bytes[:-FOOTER_TOTAL_SIZE]
-    signature = file_bytes[-FOOTER_TOTAL_SIZE:-len(FOOTER_TAG)]
+    meta_json = json.dumps(metadata).encode("utf-8")
+    data_to_verify = raw_content + meta_json
 
-    # Validate the signature
     try:
         public_key.verify(
             signature,
-            original_content,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
+            data_to_verify,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
             hashes.SHA256()
         )
         return {
             "status": "authentic",
-            "message": "File signature is valid. Original creator identity confirmed!"
+            "message": "Signature is valid and registered!",
+            "world_title": metadata.get("world_title", "Untitled"),
+            "author_name": metadata.get("author_name", "Unknown"),
+            "copy_label": metadata.get("copy_label", "N/A")
         }
     except Exception:
-        return {
-            "status": "tampered",
-            "message": "File modified! The digital signature does not match the content."
-        }
+        return {"status": "tampered", "message": "File modified! Signature check failed."}
+
+
+@app.post("/release")
+async def release_ownership(
+    file: UploadFile = File(...),
+    passphrase: str = Form("")
+):
+    _, public_key = get_keys()
+    file_bytes = await file.read()
+
+    raw_content, metadata, signature = parse_footer(file_bytes)
+    if not signature:
+        raise HTTPException(status_code=400, detail="File is not signed.")
+
+    # Verify passphrase
+    stored_hash = metadata.get("passphrase_hash", "")
+    if stored_hash:
+        input_hash = hashlib.sha256(passphrase.encode()).hexdigest()
+        if input_hash != stored_hash:
+            raise HTTPException(status_code=401, detail="Incorrect passphrase.")
+
+    return Response(
+        content=raw_content,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename=released_{file.filename}"}
+    )
