@@ -16,7 +16,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"],  # Exposes the filename header to the browser
+    expose_headers=["Content-Disposition"],
 )
 
 # UPSTASH REDIS REST API HELPER
@@ -112,7 +112,7 @@ def get_keys():
 
 
 def extract_shapes_list(world_data: dict):
-    """Filters and extracts ONLY custom building shapes from the file."""
+    """Filters and extracts custom building shapes along with position and scale."""
     shapes = []
     total_items_count = 0
 
@@ -126,8 +126,10 @@ def extract_shapes_list(world_data: dict):
         nonlocal total_items_count
         if isinstance(node, dict):
             x = y = z = None
+            sx = sy = sz = 1.0
             obj_name = str(node.get("n", node.get("name", node.get("type", "item"))))
 
+            # Parse Position
             for p_key in ("p", "pos", "position", "location"):
                 if p_key in node and isinstance(node[p_key], (list, tuple)) and len(node[p_key]) >= 3:
                     nx, ny, nz = parse_num(node[p_key][0]), parse_num(node[p_key][1]), parse_num(node[p_key][2])
@@ -144,6 +146,14 @@ def extract_shapes_list(world_data: dict):
                             x, y, z = nx, ny, nz
                             break
 
+            # Parse Scale
+            for s_key in ("s", "scale", "size"):
+                if s_key in node and isinstance(node[s_key], (list, tuple)) and len(node[s_key]) >= 3:
+                    nsx, nsy, nsz = parse_num(node[s_key][0]), parse_num(node[s_key][1]), parse_num(node[s_key][2])
+                    if nsx is not None and nsy is not None and nsz is not None:
+                        sx, sy, sz = nsx, nsy, nsz
+                        break
+
             if x is not None and y is not None and z is not None and obj_name.lower() != "group":
                 total_items_count += 1
                 if is_base_shape(obj_name):
@@ -151,7 +161,10 @@ def extract_shapes_list(world_data: dict):
                         "name": obj_name.lower(),
                         "x": float(x),
                         "y": float(y),
-                        "z": float(z)
+                        "z": float(z),
+                        "sx": round(float(sx), 1),
+                        "sy": round(float(sy), 1),
+                        "sz": round(float(sz), 1)
                     })
 
             for v in node.values():
@@ -167,8 +180,8 @@ def extract_shapes_list(world_data: dict):
 
 def match_shapes_with_delta_alignment(list_a, list_b):
     """
-    Measures custom architecture overlap using delta spatial alignment.
-    Evaluates against min(len_A, len_B) to prevent dilution from extra objects.
+    Measures custom architecture overlap using delta spatial alignment and scale matching.
+    Enforces a minimum 3-shape match threshold (noise floor) to prevent accidental false positives.
     """
     if not list_a or not list_b:
         return 0, 0
@@ -184,20 +197,36 @@ def match_shapes_with_delta_alignment(list_a, list_b):
     for a in sample_a:
         matches = b_by_name.get(a["name"], [])
         for b in matches:
-            dx = round(b["x"] - a["x"], 1)
-            dy = round(b["y"] - a["y"], 1)
-            dz = round(b["z"] - a["z"], 1)
-            key = (dx, dy, dz)
-            delta_counts[key] = delta_counts.get(key, 0) + 1
+            # Require shape dimensions (scale) to match before building candidate offset
+            if abs(b["sx"] - a["sx"]) <= 0.1 and abs(b["sy"] - a["sy"]) <= 0.1 and abs(b["sz"] - a["sz"]) <= 0.1:
+                dx = round(b["x"] - a["x"], 1)
+                dy = round(b["y"] - a["y"], 1)
+                dz = round(b["z"] - a["z"], 1)
+                key = (dx, dy, dz)
+                delta_counts[key] = delta_counts.get(key, 0) + 1
 
     if not delta_counts:
         return 0, 0
 
     best_dx, best_dy, best_dz = max(delta_counts, key=delta_counts.get)
+    best_count = delta_counts[(best_dx, best_dy, best_dz)]
+
+    # NOISE FLOOR: Discard candidate vectors with fewer than 3 matching shapes
+    min_required_matches = 3
+    if min(len(list_a), len(list_b)) >= 5 and best_count < min_required_matches:
+        return 0, 0
 
     a_spatial = set()
     for a in list_a:
-        a_spatial.add((a["name"], round(a["x"], 1), round(a["y"], 1), round(a["z"], 1)))
+        a_spatial.add((
+            a["name"],
+            round(a["x"], 1),
+            round(a["y"], 1),
+            round(a["z"], 1),
+            a["sx"],
+            a["sy"],
+            a["sz"]
+        ))
 
     shared_count = 0
     matched_keys = set()
@@ -215,7 +244,10 @@ def match_shapes_with_delta_alignment(list_a, list_b):
                         b["name"],
                         round(shifted_x + dx, 1),
                         round(shifted_y + dy, 1),
-                        round(shifted_z + dz, 1)
+                        round(shifted_z + dz, 1),
+                        b["sx"],
+                        b["sy"],
+                        b["sz"]
                     )
                     if test_key in a_spatial and test_key not in matched_keys:
                         matched = True
