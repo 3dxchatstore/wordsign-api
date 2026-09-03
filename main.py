@@ -98,7 +98,7 @@ def get_keys():
 
 
 def extract_fingerprint(world_data: dict) -> set:
-    """Universal 3D layout scanner that detects any coordinate format."""
+    """Universal 3D layout scanner that handles single-letter keys (p, n) and nested groups."""
     tokens = set()
 
     def parse_num(val):
@@ -109,51 +109,36 @@ def extract_fingerprint(world_data: dict) -> set:
 
     def scan_node(node):
         if isinstance(node, dict):
-            # Normalize dictionary keys to lowercase for flexible matching
-            low_dict = {str(k).lower(): v for k, v in node.items()}
-
             x = y = z = None
+            obj_name = str(node.get("n", node.get("name", node.get("type", "item"))))
 
-            # 1. Check direct x, y, z or px, py, pz coordinate keys
-            for x_k, y_k, z_k in [("x", "y", "z"), ("px", "py", "pz"), ("posx", "posy", "posz")]:
-                if x_k in low_dict and y_k in low_dict and z_k in low_dict:
-                    nx, ny, nz = parse_num(low_dict[x_k]), parse_num(low_dict[y_k]), parse_num(low_dict[z_k])
+            # 1. Read array positions from short keys like "p" or "pos" (e.g. "p": [18.91, 13.20, 0.0])
+            for p_key in ("p", "pos", "position", "location"):
+                if p_key in node and isinstance(node[p_key], (list, tuple)) and len(node[p_key]) >= 3:
+                    nx, ny, nz = parse_num(node[p_key][0]), parse_num(node[p_key][1]), parse_num(node[p_key][2])
                     if nx is not None and ny is not None and nz is not None:
                         x, y, z = nx, ny, nz
                         break
 
-            # 2. Check position sub-structures (e.g. "pos": [x, y, z] or "position": {"x":..., "y":..., "z":...})
+            # 2. Read explicit coordinate key-values if array was not found
             if x is None:
-                for p_k in ("pos", "position", "location", "transform"):
-                    if p_k in low_dict:
-                        p_val = low_dict[p_k]
-                        if isinstance(p_val, (list, tuple)) and len(p_val) >= 3:
-                            nx, ny, nz = parse_num(p_val[0]), parse_num(p_val[1]), parse_num(p_val[2])
-                            if nx is not None and ny is not None and nz is not None:
-                                x, y, z = nx, ny, nz
-                                break
-                        elif isinstance(p_val, dict):
-                            p_low = {str(k).lower(): v for k, v in p_val.items()}
-                            if "x" in p_low and "y" in p_low and "z" in p_low:
-                                nx, ny, nz = parse_num(p_low["x"]), parse_num(p_low["y"]), parse_num(p_low["z"])
-                                if nx is not None and ny is not None and nz is not None:
-                                    x, y, z = nx, ny, nz
-                                    break
+                low_dict = {str(k).lower(): v for k, v in node.items()}
+                for x_k, y_k, z_k in [("x", "y", "z"), ("px", "py", "pz")]:
+                    if x_k in low_dict and y_k in low_dict and z_k in low_dict:
+                        nx, ny, nz = parse_num(low_dict[x_k]), parse_num(low_dict[y_k]), parse_num(low_dict[z_k])
+                        if nx is not None and ny is not None and nz is not None:
+                            x, y, z = nx, ny, nz
+                            break
 
-            # 3. If valid 3D coordinates exist, create an item token rounded to ~10cm grid tolerance
-            if x is not None and y is not None and z is not None:
-                obj_name = "item"
-                for n_k in ("name", "type", "prefab", "model", "id", "item"):
-                    if n_k in low_dict and low_dict[n_k]:
-                        obj_name = str(low_dict[n_k])
-                        break
-
+            # Ignore generic "group" containers and save valid object position tokens
+            if x is not None and y is not None and z is not None and obj_name.lower() != "group":
                 token = f"{obj_name}_{round(x, 1)}_{round(y, 1)}_{round(z, 1)}"
                 tokens.add(token)
 
-            # Traverse child objects
+            # Traverse child elements recursively
             for v in node.values():
                 scan_node(v)
+
         elif isinstance(node, list):
             for item in node:
                 scan_node(item)
