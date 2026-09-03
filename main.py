@@ -88,44 +88,63 @@ async def sign_world(
     author_name: str = Form(""),
     contact: str = Form(""),
     copy_label: str = Form(""),
-    passphrase: str = Form("")
+    passphrase: str = Form(""),
+    is_update: bool = Form(False)
 ):
     original_bytes = await file.read()
 
-    # Parse .world file as JSON
     try:
         world_data = json.loads(original_bytes.decode("utf-8"))
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid .world JSON file.")
 
+    existing_registry = world_data.get("_ProtectionRegistry")
+    final_author = author_name.strip()
+
+    # If updating an existing registered file
+    if existing_registry and isinstance(existing_registry, dict):
+        existing_hash = existing_registry.get("passphrase_hash", "")
+        
+        # Enforce Passphrase check
+        if existing_hash:
+            input_hash = hashlib.sha256(passphrase.encode()).hexdigest() if passphrase else ""
+            if input_hash != existing_hash:
+                raise HTTPException(
+                    status_code=401, 
+                    detail="File protected! Incorrect passphrase. Only the original builder can update this world."
+                )
+
+        # Carry over original author name automatically
+        original_author = existing_registry.get("author_name", "")
+        if original_author:
+            final_author = original_author
+
+    if not final_author:
+        final_author = "Unknown"
+
     pass_hash = hashlib.sha256(passphrase.encode()).hexdigest() if passphrase else ""
 
-    # Inject metadata key directly inside the JSON structure
     world_data["_ProtectionRegistry"] = {
-        "world_title": world_title,
-        "author_name": author_name,
-        "contact": contact,
+        "world_title": world_title if world_title.strip() else (existing_registry.get("world_title") if existing_registry else "Untitled"),
+        "author_name": final_author,
+        "contact": contact if contact.strip() else (existing_registry.get("contact") if existing_registry else ""),
         "copy_label": copy_label,
         "passphrase_hash": pass_hash
     }
 
     signed_json_bytes = json.dumps(world_data, indent=2).encode("utf-8")
 
-    # Update stats & history log
     stats_data["protected"] += 1
     t_clean = world_title.strip() if world_title.strip() else "Untitled"
-    a_clean = author_name.strip() if author_name.strip() else "Anonymous"
 
-    if author_name.strip():
-        stats_data["authors"].add(author_name.strip().lower())
-
-    stats_data["history"].insert(0, {"title": t_clean, "author": a_clean})
+    stats_data["authors"].add(final_author.lower())
+    stats_data["history"].insert(0, {"title": t_clean, "author": final_author})
     stats_data["history"] = stats_data["history"][:20]
     save_stats()
 
-    safe_author = (author_name.strip() if author_name.strip() else "Unknown").replace(" ", "_")
+    safe_author = final_author.replace(" ", "_")
     base_name = file.filename.replace(".world", "")
-    download_filename = f"signed_{safe_author}_{base_name}.world"
+    download_filename = f"updated_{safe_author}_{base_name}.world" if is_update else f"signed_{safe_author}_{base_name}.world"
 
     return Response(
         content=signed_json_bytes,
@@ -182,7 +201,6 @@ async def release_ownership(
             if input_hash != stored_hash:
                 raise HTTPException(status_code=401, detail="Incorrect passphrase.")
 
-        # Remove protection key to restore clean file
         del world_data["_ProtectionRegistry"]
         released_bytes = json.dumps(world_data, indent=2).encode("utf-8")
 
