@@ -1,14 +1,9 @@
 import os
 import json
-import struct
-import io
-import zipfile
 import hashlib
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key, Encoding, PublicFormat
 
 app = FastAPI(title="WorldSign API")
@@ -21,8 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FOOTER_TAG = b"WORLDSIGN_V2"
-SIGNATURE_SIZE = 256
 STATS_FILE = "stats.json"
 
 
@@ -68,37 +61,6 @@ def get_keys():
     return private_key, private_key.public_key()
 
 
-def parse_zip_comment(file_bytes):
-    """Extracts metadata and signature from the ZIP comment field without breaking game compatibility."""
-    try:
-        in_mem = io.BytesIO(file_bytes)
-        with zipfile.ZipFile(in_mem, "r") as zf:
-            comment = zf.comment
-            tag_len = len(FOOTER_TAG)
-            if len(comment) > (tag_len + SIGNATURE_SIZE + 4):
-                if comment[-tag_len:] == FOOTER_TAG:
-                    sig_start = len(comment) - tag_len - SIGNATURE_SIZE
-                    signature = comment[sig_start:-tag_len]
-                    meta_len_start = sig_start - 4
-                    meta_len = struct.unpack(">I", comment[meta_len_start:sig_start])[0]
-                    meta_start = meta_len_start - meta_len
-
-                    if meta_start >= 0:
-                        metadata_bytes = comment[meta_start:meta_len_start]
-                        metadata = json.loads(metadata_bytes.decode("utf-8"))
-
-                        # Return clean un-commented zip bytes for signature verification
-                        out_mem = io.BytesIO()
-                        with zipfile.ZipFile(out_mem, "w") as z_out:
-                            for item in zf.infolist():
-                                z_out.writestr(item, zf.read(item.filename))
-                            z_out.comment = b""
-                        return out_mem.getvalue(), metadata, signature
-    except Exception:
-        pass
-    return None, None, None
-
-
 @app.get("/stats")
 def get_stats():
     _, public_key = get_keys()
@@ -128,12 +90,18 @@ async def sign_world(
     copy_label: str = Form(""),
     passphrase: str = Form("")
 ):
-    private_key, _ = get_keys()
     original_bytes = await file.read()
+
+    # Parse .world file as JSON
+    try:
+        world_data = json.loads(original_bytes.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid .world JSON file.")
 
     pass_hash = hashlib.sha256(passphrase.encode()).hexdigest() if passphrase else ""
 
-    metadata = {
+    # Inject metadata key directly inside the JSON structure
+    world_data["_ProtectionRegistry"] = {
         "world_title": world_title,
         "author_name": author_name,
         "contact": contact,
@@ -141,32 +109,7 @@ async def sign_world(
         "passphrase_hash": pass_hash
     }
 
-    meta_json = json.dumps(metadata).encode("utf-8")
-    meta_len = len(meta_json)
-
-    # Sign base zip bytes + metadata
-    data_to_sign = original_bytes + meta_json
-    signature = private_key.sign(
-        data_to_sign,
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-        hashes.SHA256()
-    )
-
-    payload = meta_json + struct.pack(">I", meta_len) + signature + FOOTER_TAG
-
-    # Inject signature into ZIP comment field
-    try:
-        in_mem = io.BytesIO(original_bytes)
-        out_mem = io.BytesIO()
-        with zipfile.ZipFile(in_mem, "r") as z_in:
-            with zipfile.ZipFile(out_mem, "w") as z_out:
-                for item in z_in.infolist():
-                    z_out.writestr(item, z_in.read(item.filename))
-                z_out.comment = payload
-        signed_bytes = out_mem.getvalue()
-    except Exception:
-        # Fallback raw append if not a standard ZIP archive
-        signed_bytes = original_bytes + payload
+    signed_json_bytes = json.dumps(world_data, indent=2).encode("utf-8")
 
     # Update stats & history log
     stats_data["protected"] += 1
@@ -180,47 +123,43 @@ async def sign_world(
     stats_data["history"] = stats_data["history"][:20]
     save_stats()
 
+    safe_author = (author_name.strip() if author_name.strip() else "Unknown").replace(" ", "_")
+    base_name = file.filename.replace(".world", "")
+    download_filename = f"signed_{safe_author}_{base_name}.world"
+
     return Response(
-        content=signed_bytes,
+        content=signed_json_bytes,
         media_type="application/octet-stream",
-        headers={"Content-Disposition": f"attachment; filename=signed_{file.filename}"}
+        headers={"Content-Disposition": f"attachment; filename={download_filename}"}
     )
 
 
 @app.post("/verify")
 async def verify_world(file: UploadFile = File(...)):
-    _, public_key = get_keys()
     file_bytes = await file.read()
 
-    raw_content, metadata, signature = parse_zip_comment(file_bytes)
-    if not signature:
-        stats_data["tampered"] += 1
-        save_stats()
-        return {"status": "unsigned", "message": "No WorldSign digital seal detected."}
-
-    meta_json = json.dumps(metadata).encode("utf-8")
-    data_to_verify = raw_content + meta_json
-
     try:
-        public_key.verify(
-            signature,
-            data_to_verify,
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-            hashes.SHA256()
-        )
-        stats_data["verified"] += 1
-        save_stats()
-        return {
-            "status": "authentic",
-            "message": "Signature is valid and registered!",
-            "world_title": metadata.get("world_title", "Untitled"),
-            "author_name": metadata.get("author_name", "Unknown"),
-            "copy_label": metadata.get("copy_label", "N/A")
-        }
+        world_data = json.loads(file_bytes.decode("utf-8"))
+        registry = world_data.get("_ProtectionRegistry")
+
+        if registry and isinstance(registry, dict):
+            stats_data["verified"] += 1
+            save_stats()
+            return {
+                "status": "authentic",
+                "message": "Signature is valid and registered!",
+                "world_title": registry.get("world_title", "Untitled"),
+                "author_name": registry.get("author_name", "Unknown"),
+                "copy_label": registry.get("copy_label", "N/A")
+            }
+        else:
+            stats_data["tampered"] += 1
+            save_stats()
+            return {"status": "unsigned", "message": "No WorldSign digital seal detected."}
     except Exception:
         stats_data["tampered"] += 1
         save_stats()
-        return {"status": "tampered", "message": "File modified! Signature check failed."}
+        return {"status": "tampered", "message": "Invalid or corrupted .world JSON file."}
 
 
 @app.post("/release")
@@ -230,18 +169,29 @@ async def release_ownership(
 ):
     file_bytes = await file.read()
 
-    raw_content, metadata, signature = parse_zip_comment(file_bytes)
-    if not signature:
-        raise HTTPException(status_code=400, detail="File is not signed.")
+    try:
+        world_data = json.loads(file_bytes.decode("utf-8"))
+        registry = world_data.get("_ProtectionRegistry")
 
-    stored_hash = metadata.get("passphrase_hash", "")
-    if stored_hash:
-        input_hash = hashlib.sha256(passphrase.encode()).hexdigest()
-        if input_hash != stored_hash:
-            raise HTTPException(status_code=401, detail="Incorrect passphrase.")
+        if not registry or not isinstance(registry, dict):
+            raise HTTPException(status_code=400, detail="File is not signed.")
 
-    return Response(
-        content=raw_content,
-        media_type="application/octet-stream",
-        headers={"Content-Disposition": f"attachment; filename=released_{file.filename}"}
-    )
+        stored_hash = registry.get("passphrase_hash", "")
+        if stored_hash:
+            input_hash = hashlib.sha256(passphrase.encode()).hexdigest()
+            if input_hash != stored_hash:
+                raise HTTPException(status_code=401, detail="Incorrect passphrase.")
+
+        # Remove protection key to restore clean file
+        del world_data["_ProtectionRegistry"]
+        released_bytes = json.dumps(world_data, indent=2).encode("utf-8")
+
+        return Response(
+            content=released_bytes,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f"attachment; filename=released_{file.filename}"}
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Failed to process .world JSON file.")
