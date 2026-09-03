@@ -97,9 +97,14 @@ def get_keys():
     return private_key, private_key.public_key()
 
 
-def extract_fingerprint(world_data: dict) -> set:
-    """Universal 3D layout scanner that handles single-letter keys (p, n) and nested groups."""
-    tokens = set()
+def extract_fingerprints(world_data: dict):
+    """
+    Extracts two-layer 3D fingerprints:
+    1. Shape-Only FP (Basic architecture blocks)
+    2. Full Map FP (All items including furniture)
+    Applies Bounding-Box Centering and Scale Normalization.
+    """
+    raw_items = []
 
     def parse_num(val):
         try:
@@ -112,7 +117,6 @@ def extract_fingerprint(world_data: dict) -> set:
             x = y = z = None
             obj_name = str(node.get("n", node.get("name", node.get("type", "item"))))
 
-            # 1. Read array positions from short keys like "p" or "pos" (e.g. "p": [18.91, 13.20, 0.0])
             for p_key in ("p", "pos", "position", "location"):
                 if p_key in node and isinstance(node[p_key], (list, tuple)) and len(node[p_key]) >= 3:
                     nx, ny, nz = parse_num(node[p_key][0]), parse_num(node[p_key][1]), parse_num(node[p_key][2])
@@ -120,7 +124,6 @@ def extract_fingerprint(world_data: dict) -> set:
                         x, y, z = nx, ny, nz
                         break
 
-            # 2. Read explicit coordinate key-values if array was not found
             if x is None:
                 low_dict = {str(k).lower(): v for k, v in node.items()}
                 for x_k, y_k, z_k in [("x", "y", "z"), ("px", "py", "pz")]:
@@ -130,12 +133,9 @@ def extract_fingerprint(world_data: dict) -> set:
                             x, y, z = nx, ny, nz
                             break
 
-            # Ignore generic "group" containers and save valid object position tokens
             if x is not None and y is not None and z is not None and obj_name.lower() != "group":
-                token = f"{obj_name}_{round(x, 1)}_{round(y, 1)}_{round(z, 1)}"
-                tokens.add(token)
+                raw_items.append({"name": obj_name, "x": x, "y": y, "z": z})
 
-            # Traverse child elements recursively
             for v in node.values():
                 scan_node(v)
 
@@ -144,11 +144,51 @@ def extract_fingerprint(world_data: dict) -> set:
                 scan_node(item)
 
     scan_node(world_data)
-    return tokens
+
+    if not raw_items:
+        return set(), set(), 0, 0
+
+    # Calculate bounding box for center calculation
+    xs = [i["x"] for i in raw_items]
+    ys = [i["y"] for i in raw_items]
+    zs = [i["z"] for i in raw_items]
+
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    min_z, max_z = min(zs), max(zs)
+
+    cx = (min_x + max_x) / 2.0
+    cy = (min_y + max_y) / 2.0
+    cz = (min_z + max_z) / 2.0
+
+    # Max dimension for scale normalization
+    max_dim = max(max_x - min_x, max_y - min_y, max_z - min_z)
+    if max_dim <= 0.0001:
+        max_dim = 1.0
+
+    shapes_fp = set()
+    all_fp = set()
+
+    shape_keywords = {"box", "cube", "sphere", "cylinder", "triangle", "cone", "pyramid", "plane", "quad", "prism"}
+    shapes_count = 0
+
+    for item in raw_items:
+        # Centered and normalized coordinates (rounded to 2 decimal places)
+        rx = round((item["x"] - cx) / max_dim, 2)
+        ry = round((item["y"] - cy) / max_dim, 2)
+        rz = round((item["z"] - cz) / max_dim, 2)
+
+        token = f"{item['name'].lower()}_{rx}_{ry}_{rz}"
+        all_fp.add(token)
+
+        if item["name"].lower() in shape_keywords:
+            shapes_fp.add(token)
+            shapes_count += 1
+
+    return shapes_fp, all_fp, shapes_count, len(raw_items)
 
 
 def compute_similarity(set_a: set, set_b: set) -> float:
-    """Calculates similarity score (0.0 to 1.0) between two room layouts."""
     if not set_a or not set_b:
         return 0.0
     shared = len(set_a.intersection(set_b))
@@ -181,6 +221,7 @@ async def sign_world(
     file: UploadFile = File(...),
     world_title: str = Form(""),
     author_name: str = Form(""),
+    author: str = Form(""),
     contact: str = Form(""),
     copy_label: str = Form(""),
     passphrase: str = Form(""),
@@ -195,7 +236,7 @@ async def sign_world(
         raise HTTPException(status_code=400, detail="Invalid .world JSON file.")
 
     existing_registry = world_data.get("_ProtectionRegistry")
-    final_author = author_name.strip()
+    submitted_author = author_name.strip() or author.strip()
 
     if existing_registry and isinstance(existing_registry, dict):
         existing_hash = existing_registry.get("passphrase_hash", "")
@@ -208,22 +249,28 @@ async def sign_world(
                 )
 
         original_author = existing_registry.get("author_name", "")
-        if original_author:
-            final_author = original_author
+        final_author = submitted_author if submitted_author else original_author
+    else:
+        final_author = submitted_author
 
     if not final_author:
         final_author = "Unknown"
 
-    current_fp = extract_fingerprint(world_data)
+    shapes_fp, all_fp, shapes_cnt, total_cnt = extract_fingerprints(world_data)
     stored_fps = load_fingerprints()
 
-    if not is_update and not force_register and current_fp:
+    # Two-layer background database scan
+    if not is_update and not force_register and (shapes_fp or all_fp):
         for entry in stored_fps:
-            prev_fp = set(entry.get("fp", []))
-            score = compute_similarity(current_fp, prev_fp)
+            prev_shapes = set(entry.get("shapes_fp", []))
+            prev_all = set(entry.get("all_fp", entry.get("fp", [])))
 
-            if score >= 0.80:
-                match_pct = int(score * 100)
+            score_shapes = compute_similarity(shapes_fp, prev_shapes)
+            score_all = compute_similarity(all_fp, prev_all)
+            highest_score = max(score_shapes, score_all)
+
+            if highest_score >= 0.80:
+                match_pct = int(highest_score * 100)
                 orig_title = entry.get("title", "Untitled")
                 orig_author = entry.get("author", "Unknown")
                 return Response(
@@ -232,29 +279,32 @@ async def sign_world(
                         "match_percentage": match_pct,
                         "matched_title": orig_title,
                         "matched_author": orig_author,
-                        "message": f"A similar file with {match_pct}% structural similarity has been uploaded before ('{orig_title}' by {orig_author})."
+                        "message": f"A similar file with {match_pct}% layout similarity has been uploaded before ('{orig_title}' by {orig_author})."
                     }),
                     status_code=200,
                     media_type="application/json"
                 )
 
     pass_hash = hashlib.sha256(passphrase.encode()).hexdigest() if passphrase else ""
+    timestamp_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     world_data["_ProtectionRegistry"] = {
-        "world_title": world_title if world_title.strip() else (existing_registry.get("world_title") if existing_registry else "Untitled"),
+        "world_title": world_title.strip() if world_title.strip() else (existing_registry.get("world_title") if existing_registry else "Untitled"),
         "author_name": final_author,
-        "contact": contact if contact.strip() else (existing_registry.get("contact") if existing_registry else ""),
+        "contact": contact.strip() if contact.strip() else (existing_registry.get("contact") if existing_registry else ""),
         "copy_label": copy_label,
+        "timestamp": timestamp_str,
         "passphrase_hash": pass_hash
     }
 
     signed_json_bytes = json.dumps(world_data, indent=2).encode("utf-8")
 
-    if current_fp:
+    if all_fp:
         stored_fps.insert(0, {
             "title": world_title or "Untitled",
             "author": final_author,
-            "fp": list(current_fp)
+            "shapes_fp": list(shapes_fp),
+            "all_fp": list(all_fp)
         })
         save_fingerprints(stored_fps)
 
@@ -266,11 +316,11 @@ async def sign_world(
     stats_data["history"] = stats_data["history"][:20]
     save_stats()
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SUTC")
+    filename_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SUTC")
     safe_author = final_author.replace(" ", "_")
     base_name = file.filename.replace(".world", "")
     prefix = "updated" if is_update else "signed"
-    download_filename = f"{prefix}_{safe_author}_{base_name}_{timestamp}.world"
+    download_filename = f"{prefix}_{safe_author}_{base_name}_{filename_timestamp}.world"
 
     return Response(
         content=signed_json_bytes,
@@ -295,7 +345,9 @@ async def verify_world(file: UploadFile = File(...)):
                 "message": "Signature is valid and registered!",
                 "world_title": registry.get("world_title", "Untitled"),
                 "author_name": registry.get("author_name", "Unknown"),
-                "copy_label": registry.get("copy_label", "N/A")
+                "contact": registry.get("contact", ""),
+                "copy_label": registry.get("copy_label", "N/A"),
+                "timestamp": registry.get("timestamp", "N/A")
             }
         else:
             stats_data["tampered"] += 1
@@ -355,19 +407,22 @@ async def compare_two_files(
     except Exception:
         raise HTTPException(status_code=400, detail="One or both files are invalid .world JSON.")
 
-    fp_a = extract_fingerprint(data_a)
-    fp_b = extract_fingerprint(data_b)
+    shapes_a, all_a, shapes_cnt_a, total_cnt_a = extract_fingerprints(data_a)
+    shapes_b, all_b, shapes_cnt_b, total_cnt_b = extract_fingerprints(data_b)
 
-    if not fp_a or not fp_b:
-        return {"match_percentage": 0, "file_a_objects": len(fp_a), "file_b_objects": len(fp_b), "shared_objects": 0}
+    score_shapes = compute_similarity(shapes_a, shapes_b)
+    score_all = compute_similarity(all_a, all_b)
 
-    score = compute_similarity(fp_a, fp_b)
-    match_pct = int(score * 100)
-    shared_count = len(fp_a.intersection(fp_b))
+    shapes_pct = int(score_shapes * 100)
+    all_pct = int(score_all * 100)
+    highest_pct = max(shapes_pct, all_pct)
 
     return {
-        "match_percentage": match_pct,
-        "file_a_objects": len(fp_a),
-        "file_b_objects": len(fp_b),
-        "shared_objects": shared_count
+        "highest_match_percentage": highest_pct,
+        "shapes_match_percentage": shapes_pct,
+        "all_match_percentage": all_pct,
+        "file_a": {"shapes": shapes_cnt_a, "total": total_cnt_a},
+        "file_b": {"shapes": shapes_cnt_b, "total": total_cnt_b},
+        "shared_shapes": len(shapes_a.intersection(shapes_b)),
+        "shared_all": len(all_a.intersection(all_b))
     }
