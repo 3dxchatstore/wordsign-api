@@ -22,6 +22,19 @@ app.add_middleware(
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
+SHAPE_PREFIXES = (
+    "box", "pyramid", "cylinder", "cone", "hemisphere", "sphere", "tube",
+    "dice", "hex", "prism", "stair", "pillow", "torus", "rock", "arch",
+    "semiarch", "chamf", "dia", "heart", "star", "pillar", "dish", "egg",
+    "arc", "twist", "web", "curt", "sofa", "cover", "towel", "cutlery", "quad", "plane"
+)
+
+
+def is_base_shape(obj_name: str) -> bool:
+    """Checks if an object name belongs to the 3DXChat base shape whitelist."""
+    low = obj_name.lower().strip()
+    return any(low.startswith(prefix) for prefix in SHAPE_PREFIXES)
+
 
 def redis_cmd(command_list):
     """Executes commands on Upstash Redis over lightweight HTTP."""
@@ -98,9 +111,8 @@ def get_keys():
 
 
 def extract_item_list(world_data: dict):
-    """Extracts raw 3D item entries from nested world JSON."""
+    """Extracts 3D items and classifies them into Custom Shapes vs Premade Objects."""
     raw_items = []
-    shape_keywords = {"box", "cube", "sphere", "cylinder", "triangle", "cone", "pyramid", "plane", "quad", "prism"}
 
     def parse_num(val):
         try:
@@ -130,13 +142,12 @@ def extract_item_list(world_data: dict):
                             break
 
             if x is not None and y is not None and z is not None and obj_name.lower() != "group":
-                is_shape = obj_name.lower() in shape_keywords
                 raw_items.append({
                     "name": obj_name.lower(),
                     "x": float(x),
                     "y": float(y),
                     "z": float(z),
-                    "is_shape": is_shape
+                    "is_shape": is_base_shape(obj_name)
                 })
 
             for v in node.values():
@@ -152,7 +163,7 @@ def extract_item_list(world_data: dict):
 
 def match_sets_with_delta_alignment(list_a, list_b):
     """
-    Scans map structure using delta translation sampling.
+    Scans spatial layout using delta translation sampling.
     Evaluates relative to min(len_A, len_B) to capture both partial deletions and decor additions.
     """
     if not list_a or not list_b:
@@ -214,7 +225,6 @@ def match_sets_with_delta_alignment(list_a, list_b):
         if matched:
             shared_count += 1
 
-    # Evaluates against min_len to maximize protection against both deletions and spammed decor
     min_len = min(len(list_a), len(list_b))
     score = (shared_count / min_len) if min_len > 0 else 0.0
     return int(score * 100), shared_count
@@ -282,16 +292,18 @@ async def sign_world(
 
     items_current = extract_item_list(world_data)
     shapes_current = [i for i in items_current if i["is_shape"]]
+    premade_current = [i for i in items_current if not i["is_shape"]]
     stored_fps = load_fingerprints()
 
     if not is_update and not force_register and items_current:
         for entry in stored_fps:
-            prev_all = entry.get("items", [])
-            prev_shapes = [i for i in prev_all if i.get("is_shape")]
+            prev_items = entry.get("items", [])
+            prev_shapes = [i for i in prev_items if i.get("is_shape")]
+            prev_premade = [i for i in prev_items if not i.get("is_shape")]
 
             s_pct, _ = match_sets_with_delta_alignment(shapes_current, prev_shapes)
-            a_pct, _ = match_sets_with_delta_alignment(items_current, prev_all)
-            highest_score = max(s_pct, a_pct)
+            p_pct, _ = match_sets_with_delta_alignment(premade_current, prev_premade)
+            highest_score = max(s_pct, p_pct)
 
             if highest_score >= 80:
                 orig_title = entry.get("title", "Untitled")
@@ -435,17 +447,28 @@ async def compare_two_files(
     shapes_a = [i for i in items_a if i["is_shape"]]
     shapes_b = [i for i in items_b if i["is_shape"]]
 
-    shapes_pct, shared_shapes = match_sets_with_delta_alignment(shapes_a, shapes_b)
-    all_pct, shared_all = match_sets_with_delta_alignment(items_a, items_b)
+    premade_a = [i for i in items_a if not i["is_shape"]]
+    premade_b = [i for i in items_b if not i["is_shape"]]
 
-    highest_pct = max(shapes_pct, all_pct)
+    shapes_pct, shared_shapes = match_sets_with_delta_alignment(shapes_a, shapes_b)
+    premade_pct, shared_premade = match_sets_with_delta_alignment(premade_a, premade_b)
+
+    highest_pct = max(shapes_pct, premade_pct)
 
     return {
         "highest_match_percentage": highest_pct,
         "shapes_match_percentage": shapes_pct,
-        "all_match_percentage": all_pct,
-        "file_a": {"shapes": len(shapes_a), "total": len(items_a)},
-        "file_b": {"shapes": len(shapes_b), "total": len(items_b)},
+        "premade_match_percentage": premade_pct,
+        "file_a": {
+            "shapes": len(shapes_a),
+            "premade": len(premade_a),
+            "total": len(items_a)
+        },
+        "file_b": {
+            "shapes": len(shapes_b),
+            "premade": len(premade_b),
+            "total": len(items_b)
+        },
         "shared_shapes": shared_shapes,
-        "shared_all": shared_all
+        "shared_premade": shared_premade
     }
