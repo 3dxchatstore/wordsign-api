@@ -377,7 +377,7 @@ async def sign_world(
         "key_hash": key_hash
     }
 
-    signed_json_str = json.dumps(world_data, indent=2)
+    signed_json_str = json.dumps(world_data, separators=(',', ':'))
 
     wsig_payload = {
         "system": "WorldSign Security Registry",
@@ -478,13 +478,14 @@ async def release_ownership(
                 raise HTTPException(status_code=401, detail="Incorrect passphrase.")
 
         del world_data["_ProtectionRegistry"]
-        released_bytes = json.dumps(world_data, indent=2).encode("utf-8")
+        released_bytes = json.dumps(world_data, separators=(',', ':')).encode("utf-8")
 
         return Response(
             content=released_bytes,
             media_type="application/octet-stream",
             headers={"Content-Disposition": f"attachment; filename=released_{file.filename}"}
-        )
+)
+
     except HTTPException:
         raise
     except Exception:
